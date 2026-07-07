@@ -40,7 +40,6 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <cmath>
-#include <functional>
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOSMT
@@ -401,20 +400,19 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
     return false;
   };
 
-  // Reduction (vector) mode: encode one elementwise op at lane `k`, broadcasting
-  // scalar operands. Returns the lane result, or a null Value if `op` is not
-  // among the elementwise ops supported in vector context (the caller then
-  // rejects it). This intentionally mirrors the scalar rules in the TypeSwitch
-  // below for the subset of ops that can feed a reduction.
-  std::function<Value(Operation *, unsigned)> encodeVectorLane =
-      [&](Operation *op, unsigned k) -> Value {
-    auto A = [&](Value v) -> Value {
-      auto it = env.find(v);
-      return it == env.end() ? Value() : it->second.laneVal(k);
-    };
-    auto rcmp = [&](smt::IntPredicate p, Value x, Value y) {
-      return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
-    };
+  auto rcmp = [&](smt::IntPredicate p, Value x, Value y) {
+    return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
+  };
+
+  // The single source of truth for pure elementwise op semantics, shared by
+  // the scalar path, the per-lane (reduction) path, and the reduce combiner.
+  // Operands are fetched through `A`, which reads the plain value in scalar
+  // context and the lane value (broadcasting scalars) in vector context.
+  // Returns the encoded value; a null result with a non-empty `why` is a
+  // rejection (unsupported flag/operand sort), and a null result with an empty
+  // `why` means `op` is not a pure elementwise op at all.
+  auto encodeElementwise = [&](Operation *op, llvm::function_ref<Value(Value)> A,
+                               std::string &why) -> Value {
     return llvm::TypeSwitch<Operation *, Value>(op)
         .Case<arith::AddFOp>([&](arith::AddFOp o) {
           return realBin(A(o.getLhs()), A(o.getRhs()), /*mul=*/false);
@@ -431,6 +429,9 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               .getResult();
         })
         .Case<arith::DivFOp>([&](arith::DivFOp o) {
+          // SMT-LIB real division is total but unspecified at zero
+          // denominators; both functions see the same division function, so
+          // the equivalence query stays sound.
           return smt::RealDivOp::create(b, loc, R, A(o.getLhs()), A(o.getRhs()))
               .getResult();
         })
@@ -442,31 +443,151 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           Value x = A(o.getLhs()), y = A(o.getRhs());
           return ite(rcmp(smt::IntPredicate::le, x, y), x, y);
         })
-        // Integer (bit-vector) arithmetic feeding address computation. i1
-        // operands and overflow flags are rejected exactly as in the scalar
-        // rules (return null -> caller rejects).
-        .Case<arith::AddIOp>([&](arith::AddIOp o) -> Value {
-          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
-              isa<smt::BoolType>(A(o.getLhs()).getType()))
-            return Value();
-          return smt::BVAddOp::create(b, loc, A(o.getLhs()), A(o.getRhs()))
-              .getResult();
+        .Case<math::AbsFOp>([&](math::AbsFOp o) {
+          Value x = A(o.getOperand());
+          Value isNeg = rcmp(smt::IntPredicate::lt, x, realConst("0.0"));
+          Value negX = smt::RealNegOp::create(b, loc, R, x).getResult();
+          return ite(isNeg, negX, x);
         })
-        .Case<arith::MulIOp>([&](arith::MulIOp o) -> Value {
-          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
-              isa<smt::BoolType>(A(o.getLhs()).getType()))
-            return Value();
-          return smt::BVMulOp::create(b, loc, A(o.getLhs()), A(o.getRhs()))
-              .getResult();
+        .Case<math::FmaOp>([&](math::FmaOp o) {
+          Value prod =
+              realBin(A(o.getOperand(0)), A(o.getOperand(1)), /*mul=*/true);
+          return realBin(prod, A(o.getOperand(2)), /*mul=*/false);
         })
-        .Case<arith::SubIOp>([&](arith::SubIOp o) -> Value {
-          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
-              isa<smt::BoolType>(A(o.getLhs()).getType()))
+        .Case<arith::CmpFOp>([&](arith::CmpFOp o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          using P = arith::CmpFPredicate;
+          using I = smt::IntPredicate;
+          switch (o.getPredicate()) {
+          case P::OEQ: case P::UEQ: return beq(x, y);
+          case P::ONE: case P::UNE: return bnot(beq(x, y));
+          case P::OGT: case P::UGT: return rcmp(I::gt, x, y);
+          case P::OGE: case P::UGE: return rcmp(I::ge, x, y);
+          case P::OLT: case P::ULT: return rcmp(I::lt, x, y);
+          case P::OLE: case P::ULE: return rcmp(I::le, x, y);
+          default:
+            why = "unsupported cmpf predicate";
             return Value();
-          Value negY = smt::BVNegOp::create(b, loc, A(o.getRhs())).getResult();
-          return smt::BVAddOp::create(b, loc, A(o.getLhs()), negY).getResult();
+          }
+        })
+        // Integer (bit-vector) arithmetic. `i1` operands are SMT booleans, not
+        // bit-vectors, so reject them (mapping to smt.bv.* would crash); and
+        // nsw/nuw overflow flags introduce poison we do not model.
+        .Case<arith::AddIOp, arith::SubIOp, arith::MulIOp>([&](auto o) -> Value {
+          if (isa<smt::BoolType>(A(o.getLhs()).getType())) {
+            why = "i1 integer arithmetic is not supported";
+            return Value();
+          }
+          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none) {
+            why = "arith overflow flags (nsw/nuw) are not modeled";
+            return Value();
+          }
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          if (isa<arith::MulIOp>(o.getOperation()))
+            return smt::BVMulOp::create(b, loc, x, y).getResult();
+          // The smt dialect has no bvsub; use x + (-y).
+          if (isa<arith::SubIOp>(o.getOperation()))
+            y = smt::BVNegOp::create(b, loc, y).getResult();
+          return smt::BVAddOp::create(b, loc, x, y).getResult();
+        })
+        // `i1` values are SMT booleans, wider integers are bit-vectors, so the
+        // bitwise ops dispatch on the encoded operand sort.
+        .Case<arith::AndIOp>([&](arith::AndIOp o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          if (isa<smt::BoolType>(x.getType()))
+            return band(x, y);
+          return smt::BVAndOp::create(b, loc, x, y).getResult();
+        })
+        .Case<arith::OrIOp>([&](arith::OrIOp o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          if (isa<smt::BoolType>(x.getType()))
+            return smt::OrOp::create(b, loc, x, y).getResult();
+          return smt::BVOrOp::create(b, loc, x, y).getResult();
+        })
+        .Case<arith::XOrIOp>([&](arith::XOrIOp o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          if (isa<smt::BoolType>(x.getType()))
+            return smt::XOrOp::create(b, loc, x, y).getResult();
+          return smt::BVXOrOp::create(b, loc, x, y).getResult();
+        })
+        // Integer division, remainder, and shifts are intentionally NOT
+        // encoded. SMT bit-vector div/rem are total (e.g. bvudiv by zero is
+        // all-ones) and bv shifts are defined for oversized amounts, whereas
+        // the corresponding arith ops are undefined there. Without a
+        // definedness/poison model, encoding them as total operations is
+        // unsound (a kernel storing `1/0` would look equivalent to one storing
+        // `-1`), so they fall to Default and are rejected.
+        .Case<arith::CmpIOp>([&](arith::CmpIOp o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          using P = arith::CmpIPredicate;
+          using B = smt::BVCmpPredicate;
+          switch (o.getPredicate()) {
+          case P::eq: return beq(x, y);
+          case P::ne: return bnot(beq(x, y));
+          case P::slt: return bvcmp(B::slt, x, y);
+          case P::sle: return bvcmp(B::sle, x, y);
+          case P::sgt: return bvcmp(B::sgt, x, y);
+          case P::sge: return bvcmp(B::sge, x, y);
+          case P::ult: return bvcmp(B::ult, x, y);
+          case P::ule: return bvcmp(B::ule, x, y);
+          case P::ugt: return bvcmp(B::ugt, x, y);
+          case P::uge: return bvcmp(B::uge, x, y);
+          }
+          llvm_unreachable("covered switch");
+        })
+        // Casts. Only the bool-to-storage idioms are encoded: comparison
+        // results (i1) widened for storing as bytes or floats. All other
+        // width- or domain-changing casts remain rejected.
+        .Case<arith::ExtUIOp>([&](arith::ExtUIOp o) -> Value {
+          if (o.getNonNeg()) {
+            why = "extui nneg flag introduces poison we do not model";
+            return Value();
+          }
+          if (!elemOf(o.getIn().getType()).isInteger(1)) {
+            why = "only i1 sources are supported for extui";
+            return Value();
+          }
+          unsigned w = elemOf(o.getType()).getIntOrFloatBitWidth();
+          return ite(A(o.getIn()), bvc(APInt(w, 1)), bvc(APInt(w, 0)));
+        })
+        .Case<arith::UIToFPOp>([&](arith::UIToFPOp o) -> Value {
+          if (o.getNonNeg()) {
+            why = "uitofp nneg flag introduces poison we do not model";
+            return Value();
+          }
+          if (!elemOf(o.getIn().getType()).isInteger(1)) {
+            why = "only i1 sources are supported for uitofp";
+            return Value();
+          }
+          return ite(A(o.getIn()), realConst("1.0"), realConst("0.0"));
+        })
+        .Case<arith::SelectOp>([&](arith::SelectOp o) -> Value {
+          // A pointer-valued select has no plain/lane SMT value to fetch;
+          // reject it (the writer model expects one statically-known output
+          // array).
+          auto isPtrVal = [&](Value v) {
+            auto it = env.find(v);
+            return it != env.end() && it->second.isPtr();
+          };
+          if (isPtrVal(o.getTrueValue()) || isPtrVal(o.getFalseValue())) {
+            why = "pointer-valued select is not supported";
+            return Value();
+          }
+          return ite(A(o.getCondition()), A(o.getTrueValue()),
+                     A(o.getFalseValue()));
         })
         .Default([&](Operation *) { return Value(); });
+  };
+
+  // Reduction (vector) mode: encode one elementwise op at lane `k`,
+  // broadcasting scalar operands, under exactly the scalar rules.
+  auto encodeVectorLane = [&](Operation *op, unsigned k,
+                              std::string &why) -> Value {
+    auto A = [&](Value v) -> Value {
+      auto it = env.find(v);
+      return it == env.end() ? Value() : it->second.laneVal(k);
+    };
+    return encodeElementwise(op, A, why);
   };
 
   for (Operation &opRef : entry) {
@@ -515,20 +636,28 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         // Float (ideal-real) reductions only in this milestone.
         if (!isa<smt::RealType>(in.lanes.front().getType()))
           return err(o, "only floating-point (real) reductions are supported");
+        // The combiner op's semantics come from the shared elementwise
+        // encoder, with the region's block arguments bound to (acc, lane).
+        // Folding the lanes in a fixed linear order is only valid because the
+        // whitelist above admits combiners that are associative and
+        // commutative over ideal reals.
         auto combine = [&](Value acc, Value x) -> Value {
-          if (isa<arith::AddFOp>(comb))
-            return realBin(acc, x, /*mul=*/false);
-          smt::IntPredicate p =
-              (isa<arith::MaxNumFOp>(comb) || isa<arith::MaximumFOp>(comb))
-                  ? smt::IntPredicate::ge
-                  : smt::IntPredicate::le;
-          return ite(
-              smt::RealCmpOp::create(b, loc, Bool, p, acc, x).getResult(), acc,
-              x);
+          auto A = [&](Value v) -> Value {
+            if (v == combBlock.getArgument(0))
+              return acc;
+            if (v == combBlock.getArgument(1))
+              return x;
+            return Value();
+          };
+          std::string why;
+          return encodeElementwise(comb, A, why);
         };
         Value acc = in.lanes[0];
-        for (unsigned k = 1; k < N; ++k)
+        for (unsigned k = 1; k < N; ++k) {
           acc = combine(acc, in.lanes[k]);
+          if (!acc)
+            return err(o, "failed to encode tt.reduce combiner");
+        }
         env[o->getResult(0)] = EncodedValue::plain(acc);
         continue;
       }
@@ -615,16 +744,34 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
       if (anyVec) {
         SmallVector<Value> ls(N);
         for (unsigned k = 0; k < N; ++k) {
-          Value r = encodeVectorLane(op, k);
+          std::string why;
+          Value r = encodeVectorLane(op, k, why);
           if (!r)
-            return err(op, "operation '" + op->getName().getStringRef() +
-                               "' is not supported in reduction (vector) "
-                               "context");
+            return err(op, why.empty()
+                               ? ("operation '" + op->getName().getStringRef() +
+                                  "' is not supported in reduction (vector) "
+                                  "context")
+                                     .str()
+                               : why);
           ls[k] = r;
         }
         env[op->getResult(0)] = EncodedValue::vec(std::move(ls));
         continue;
       }
+    }
+
+    // Pure elementwise ops are encoded by the shared encoder (scalar context:
+    // operands are the plain values). A rejection there is final; a "not
+    // elementwise" miss falls through to the structural cases below.
+    {
+      std::string why;
+      Value r = encodeElementwise(op, V, why);
+      if (r) {
+        env[op->getResult(0)] = EncodedValue::plain(r);
+        continue;
+      }
+      if (!why.empty())
+        return err(op, why);
     }
 
     bool ok =
@@ -692,121 +839,6 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
             })
             .Case<triton::SplatOp>([&](triton::SplatOp o) {
               env[o.getResult()] = env[o.getSrc()];
-              return true;
-            })
-            // Integer (bit-vector) arithmetic. `i1` operands are SMT booleans,
-            // not bit-vectors, so reject them (mapping to smt.bv.* would crash);
-            // and nsw/nuw overflow flags introduce poison we do not model.
-            .Case<arith::AddIOp>([&](arith::AddIOp o) {
-              if (isa<smt::BoolType>(V(o.getLhs()).getType()))
-                return err(o, "i1 integer arithmetic is not supported");
-              if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none)
-                return err(o, "arith overflow flags (nsw/nuw) are not modeled");
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::BVAddOp::create(b, loc, V(o.getLhs()), V(o.getRhs()))
-                      .getResult());
-              return true;
-            })
-            .Case<arith::SubIOp>([&](arith::SubIOp o) {
-              if (isa<smt::BoolType>(V(o.getLhs()).getType()))
-                return err(o, "i1 integer arithmetic is not supported");
-              if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none)
-                return err(o, "arith overflow flags (nsw/nuw) are not modeled");
-              // The smt dialect has no bvsub; use x + (-y).
-              Value negY = smt::BVNegOp::create(b, loc, V(o.getRhs())).getResult();
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::BVAddOp::create(b, loc, V(o.getLhs()), negY).getResult());
-              return true;
-            })
-            .Case<arith::MulIOp>([&](arith::MulIOp o) {
-              if (isa<smt::BoolType>(V(o.getLhs()).getType()))
-                return err(o, "i1 integer arithmetic is not supported");
-              if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none)
-                return err(o, "arith overflow flags (nsw/nuw) are not modeled");
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::BVMulOp::create(b, loc, V(o.getLhs()), V(o.getRhs()))
-                      .getResult());
-              return true;
-            })
-            // `i1` values are SMT booleans, wider integers are bit-vectors, so
-            // the bitwise ops dispatch on the encoded operand sort.
-            .Case<arith::AndIOp>([&](arith::AndIOp o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              Value r;
-              if (isa<smt::BoolType>(x.getType()))
-                r = band(x, y);
-              else
-                r = smt::BVAndOp::create(b, loc, x, y).getResult();
-              env[o.getResult()] = EncodedValue::plain(r);
-              return true;
-            })
-            .Case<arith::OrIOp>([&](arith::OrIOp o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              Value r;
-              if (isa<smt::BoolType>(x.getType()))
-                r = smt::OrOp::create(b, loc, x, y).getResult();
-              else
-                r = smt::BVOrOp::create(b, loc, x, y).getResult();
-              env[o.getResult()] = EncodedValue::plain(r);
-              return true;
-            })
-            .Case<arith::XOrIOp>([&](arith::XOrIOp o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              Value r;
-              if (isa<smt::BoolType>(x.getType()))
-                r = smt::XOrOp::create(b, loc, x, y).getResult();
-              else
-                r = smt::BVXOrOp::create(b, loc, x, y).getResult();
-              env[o.getResult()] = EncodedValue::plain(r);
-              return true;
-            })
-            // Integer division, remainder, and shifts are intentionally NOT
-            // encoded. SMT bit-vector div/rem are total (e.g. bvudiv by zero is
-            // all-ones) and bv shifts are defined for oversized amounts, whereas
-            // the corresponding arith ops are undefined there. Without a
-            // definedness/poison model, encoding them as total operations is
-            // unsound (a kernel storing `1/0` would look equivalent to one
-            // storing `-1`), so they fall through to Default and are rejected.
-            .Case<arith::CmpIOp>([&](arith::CmpIOp o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              using P = arith::CmpIPredicate;
-              using B = smt::BVCmpPredicate;
-              Value r;
-              switch (o.getPredicate()) {
-              case P::eq: r = beq(x, y); break;
-              case P::ne: r = bnot(beq(x, y)); break;
-              case P::slt: r = bvcmp(B::slt, x, y); break;
-              case P::sle: r = bvcmp(B::sle, x, y); break;
-              case P::sgt: r = bvcmp(B::sgt, x, y); break;
-              case P::sge: r = bvcmp(B::sge, x, y); break;
-              case P::ult: r = bvcmp(B::ult, x, y); break;
-              case P::ule: r = bvcmp(B::ule, x, y); break;
-              case P::ugt: r = bvcmp(B::ugt, x, y); break;
-              case P::uge: r = bvcmp(B::uge, x, y); break;
-              }
-              env[o.getResult()] = EncodedValue::plain(r);
-              return true;
-            })
-            // Casts. Only the bool-to-storage idioms are encoded: comparison
-            // results (i1) widened for storing as bytes or floats. All other
-            // width- or domain-changing casts remain rejected.
-            .Case<arith::ExtUIOp>([&](arith::ExtUIOp o) {
-              if (o.getNonNeg())
-                return err(o, "extui nneg flag introduces poison we do not model");
-              if (!elemOf(o.getIn().getType()).isInteger(1))
-                return err(o, "only i1 sources are supported for extui");
-              unsigned w = elemOf(o.getType()).getIntOrFloatBitWidth();
-              env[o.getResult()] = EncodedValue::plain(
-                  ite(V(o.getIn()), bvc(APInt(w, 1)), bvc(APInt(w, 0))));
-              return true;
-            })
-            .Case<arith::UIToFPOp>([&](arith::UIToFPOp o) {
-              if (o.getNonNeg())
-                return err(o, "uitofp nneg flag introduces poison we do not model");
-              if (!elemOf(o.getIn().getType()).isInteger(1))
-                return err(o, "only i1 sources are supported for uitofp");
-              env[o.getResult()] = EncodedValue::plain(
-                  ite(V(o.getIn()), realConst("1.0"), realConst("0.0")));
               return true;
             })
             // Pointers / memory.
@@ -884,104 +916,6 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                 loaded = ite(V(o.getMask()), loaded, V(o.getOther()));
               }
               env[o.getResult()] = EncodedValue::plain(loaded);
-              return true;
-            })
-            // Floating-point (ideal real) arithmetic.
-            .Case<arith::MulFOp>([&](arith::MulFOp o) {
-              env[o.getResult()] =
-                  EncodedValue::plain(realBin(V(o.getLhs()), V(o.getRhs()), true));
-              return true;
-            })
-            .Case<arith::AddFOp>([&](arith::AddFOp o) {
-              env[o.getResult()] =
-                  EncodedValue::plain(realBin(V(o.getLhs()), V(o.getRhs()), false));
-              return true;
-            })
-            .Case<arith::SubFOp>([&](arith::SubFOp o) {
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::RealSubOp::create(b, loc, R, V(o.getLhs()), V(o.getRhs()))
-                      .getResult());
-              return true;
-            })
-            .Case<arith::NegFOp>([&](arith::NegFOp o) {
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::RealNegOp::create(b, loc, R, V(o.getOperand()))
-                      .getResult());
-              return true;
-            })
-            .Case<arith::DivFOp>([&](arith::DivFOp o) {
-              // SMT-LIB real division is total but unspecified at zero
-              // denominators; both functions see the same division function,
-              // so the equivalence query stays sound.
-              env[o.getResult()] = EncodedValue::plain(
-                  smt::RealDivOp::create(b, loc, R, V(o.getLhs()),
-                                         V(o.getRhs()))
-                      .getResult());
-              return true;
-            })
-            .Case<math::AbsFOp>([&](math::AbsFOp o) {
-              Value x = V(o.getOperand());
-              Value isNeg = smt::RealCmpOp::create(
-                                b, loc, Bool, smt::IntPredicate::lt, x,
-                                realConst("0.0"))
-                                .getResult();
-              Value negX = smt::RealNegOp::create(b, loc, R, x).getResult();
-              env[o.getResult()] = EncodedValue::plain(ite(isNeg, negX, x));
-              return true;
-            })
-            .Case<math::FmaOp>([&](math::FmaOp o) {
-              Value prod = realBin(V(o.getOperand(0)), V(o.getOperand(1)), true);
-              env[o.getResult()] =
-                  EncodedValue::plain(realBin(prod, V(o.getOperand(2)), false));
-              return true;
-            })
-            .Case<arith::CmpFOp>([&](arith::CmpFOp o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              using P = arith::CmpFPredicate;
-              using I = smt::IntPredicate;
-              auto rc = [&](I p) {
-                return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
-              };
-              Value r;
-              switch (o.getPredicate()) {
-              case P::OEQ: case P::UEQ: r = beq(x, y); break;
-              case P::ONE: case P::UNE: r = bnot(beq(x, y)); break;
-              case P::OGT: case P::UGT: r = rc(I::gt); break;
-              case P::OGE: case P::UGE: r = rc(I::ge); break;
-              case P::OLT: case P::ULT: r = rc(I::lt); break;
-              case P::OLE: case P::ULE: r = rc(I::le); break;
-              default: return err(o, "unsupported cmpf predicate");
-              }
-              env[o.getResult()] = EncodedValue::plain(r);
-              return true;
-            })
-            .Case<arith::SelectOp>([&](arith::SelectOp o) {
-              // Pointer-valued select has a null plain value; dereferencing it
-              // via V() would crash. Reject it (the writer model expects one
-              // statically-known output array).
-              if (env[o.getTrueValue()].isPtr() || env[o.getFalseValue()].isPtr())
-                return err(o, "pointer-valued select is not supported");
-              env[o.getResult()] = EncodedValue::plain(
-                  ite(V(o.getCondition()), V(o.getTrueValue()),
-                      V(o.getFalseValue())));
-              return true;
-            })
-            .Case<arith::MaxNumFOp, arith::MaximumFOp>([&](auto o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              env[o.getResult()] = EncodedValue::plain(
-                  ite(smt::RealCmpOp::create(b, loc, Bool, smt::IntPredicate::ge,
-                                             x, y)
-                          .getResult(),
-                      x, y));
-              return true;
-            })
-            .Case<arith::MinNumFOp, arith::MinimumFOp>([&](auto o) {
-              Value x = V(o.getLhs()), y = V(o.getRhs());
-              env[o.getResult()] = EncodedValue::plain(
-                  ite(smt::RealCmpOp::create(b, loc, Bool, smt::IntPredicate::le,
-                                             x, y)
-                          .getResult(),
-                      x, y));
               return true;
             })
             .Case<triton::StoreOp>([&](triton::StoreOp o) {

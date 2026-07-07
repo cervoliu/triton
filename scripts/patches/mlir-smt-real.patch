@@ -205,7 +205,7 @@ index d9baef98a..b0d69353b 100644
  }
  
 diff --git a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
-index 189f766c4..d637345fd 100644
+index 189f766c4..5e04af52a 100644
 --- a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
 +++ b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
 @@ -47,6 +47,10 @@ struct TypeVisitor : public smt::SMTTypeVisitor<TypeVisitor, void,
@@ -254,20 +254,36 @@ index 189f766c4..d637345fd 100644
    //===--------------------------------------------------------------------===//
    // Core theory operation visitors
    //===--------------------------------------------------------------------===//
-@@ -525,6 +557,23 @@ struct StatementVisitor
+@@ -525,6 +557,39 @@ struct StatementVisitor
      return success();
    }
  
 +  LogicalResult visitSMTOp(RealConstantOp op, mlir::raw_indented_ostream &stream,
 +                           ValueMap &valueMap) {
 +    // The attribute holds an SMT-LIB real term emitted verbatim. Guard against
-+    // injection: a real literal is a single closed term over digits, '.', '/',
-+    // unary '-', parentheses and spaces. Anything else (letters, newlines, or
-+    // embedded SMT commands) is rejected so a crafted constant cannot forge
-+    // solver output.
++    // injection: the value must use only the characters of a real literal
++    // (digits, '.', '/', unary '-', parentheses, spaces) AND be structurally a
++    // single balanced closed term. The character check alone is not enough:
++    // "1.0 1.0" or "0.0)" would splice extra operands into (or unbalance) the
++    // enclosing s-expression, making the exported formula differ from the IR.
 +    StringRef value = op.getValue();
-+    if (value.empty() ||
-+        value.find_first_not_of("0123456789./- ()\t") != StringRef::npos)
++    auto isSingleClosedTerm = [](StringRef v) {
++      v = v.trim(" \t");
++      if (v.empty())
++        return false;
++      if (v.front() != '(')
++        return v.find_first_of(" \t()") == StringRef::npos;
++      int depth = 0;
++      for (size_t i = 0, e = v.size(); i != e; ++i) {
++        if (v[i] == '(')
++          ++depth;
++        else if (v[i] == ')' && --depth == 0)
++          return i + 1 == e;
++      }
++      return false; // unbalanced
++    };
++    if (value.find_first_not_of("0123456789./- ()\t") != StringRef::npos ||
++        !isSingleClosedTerm(value))
 +      return op.emitError(
 +                 "smt.real.constant value is not a valid real literal: ")
 +             << value;

@@ -59,8 +59,12 @@ def default_triton_opt() -> str:
 
 
 def default_mlir_translate() -> str:
+    # llvm-project/ is where scripts/build-llvm-project.sh (which applies the
+    # required SMT Real-sort patch) builds by default; .llvm-project/ is a
+    # custom checkout layout (see scripts/patches/README.md).
     return _find_tool(
         "MLIR_TRANSLATE",
+        str(_REPO_ROOT / "llvm-project" / "build" / "bin" / "mlir-translate"),
         str(_REPO_ROOT / ".llvm-project" / "build" / "bin" / "mlir-translate"))
 
 
@@ -92,7 +96,9 @@ def compile_to_ttir(fn, signature: dict, constexprs: Optional[dict] = None,
     stages: dict = {}
     backend.add_stages(stages, options, src.language)
     module = stages["ttir"](module, {})
-    return str(module)
+    # Print without debug locations so the merge step needs no separate
+    # `triton-opt --strip-debuginfo` subprocess round-trip.
+    return module.str_nodebug()
 
 
 def _run(cmd, stdin_text: str, timeout: Optional[float] = None) -> str:
@@ -104,21 +110,64 @@ def _run(cmd, stdin_text: str, timeout: Optional[float] = None) -> str:
     return proc.stdout
 
 
-_FUNC_RE = re.compile(r"(tt\.func\s+(?:public\s+|private\s+)?)@\w+")
+_FUNC_RE = re.compile(r'(tt\.func\s+(?:public\s+|private\s+)?)@(?:\w+|"[^"]*")')
+
+
+def _skip_balanced(text: str, i: int) -> int:
+    """Given text[i] == '{', return the index just past the matching '}'.
+
+    String literals are skipped so braces inside quoted attribute values do not
+    confuse the balance.
+    """
+    depth = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                i += 2 if text[i] == "\\" else 1
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    raise RuntimeError("unbalanced braces in TTIR input")
+
+
+def _module_body(text: str) -> str:
+    """Extract the top-level module's body, handling `module attributes {...} {`."""
+    m = re.search(r"\bmodule\b", text)
+    if m is None:
+        raise RuntimeError("no top-level `module` found in TTIR input")
+    try:
+        open_idx = text.index("{", m.end())
+        # An `attributes {...}` clause precedes the body brace; skip it. Any
+        # module attributes are metadata this checker does not depend on, so
+        # they are dropped by the merge.
+        if "attributes" in text[m.end():open_idx]:
+            open_idx = text.index("{", _skip_balanced(text, open_idx))
+    except ValueError as e:
+        raise RuntimeError("malformed module header in TTIR input") from e
+    close_idx = _skip_balanced(text, open_idx)
+    return text[open_idx + 1:close_idx - 1].strip()
 
 
 def _strip_and_extract(ttir: str, new_name: str, triton_opt: str) -> str:
     """Strip debug info and return the single function body renamed to new_name."""
-    stripped = _run([triton_opt, "--strip-debuginfo"], ttir)
+    # compile_to_ttir already prints without locations; only file-based CLI
+    # inputs still need the strip subprocess.
+    if "loc(" in ttir or "#loc" in ttir:
+        ttir = _run([triton_opt, "--strip-debuginfo"], ttir)
     # Reject modules that do not contain exactly one function (e.g. private
     # helpers emitted for noinline kernels), which would corrupt the merge.
-    num_funcs = len(re.findall(r"\btt\.func\b", stripped))
+    num_funcs = len(re.findall(r"\btt\.func\b", ttir))
     if num_funcs != 1:
         raise RuntimeError(
             f"expected exactly one tt.func per kernel, found {num_funcs}")
-    open_brace = stripped.index("{")
-    close_brace = stripped.rindex("}")
-    body = stripped[open_brace + 1:close_brace].strip()
+    body = _module_body(ttir)
     body, n = _FUNC_RE.subn(rf"\1@{new_name}", body, count=1)
     if n != 1:
         raise RuntimeError(f"could not rename function (matched {n})")
@@ -150,7 +199,12 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
                       triton_opt: Optional[str] = None,
                       mlir_translate: Optional[str] = None,
                       z3: Optional[str] = None) -> EquivalenceResult:
-    """Check equivalence of two kernels given their TTIR text."""
+    """Check equivalence of two kernels given their TTIR text.
+
+    Kernel-dependent failures (unsupported constructs, solver timeouts) become
+    verdicts (UNSUPPORTED/UNKNOWN); environment errors (missing, unpatched, or
+    pass-less tools) raise RuntimeError with an actionable message.
+    """
     triton_opt = triton_opt or default_triton_opt()
     mlir_translate = mlir_translate or default_mlir_translate()
     z3 = z3 or default_z3()
@@ -171,12 +225,31 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
     if block_size > 0:
         pass_opt = f"--convert-triton-to-smt=block-size={block_size}"
     # The pass fails (signalPassFailure) for inputs outside its validated
-    # contract; treat that as UNSUPPORTED rather than a hard error.
+    # contract; treat that as UNSUPPORTED rather than a hard error. A triton-opt
+    # that does not register the pass at all is an environment error, not a
+    # kernel verdict: mapping it to UNSUPPORTED would make every rejection test
+    # pass vacuously, so fail loudly instead.
     try:
         smt_mlir = _run([triton_opt, pass_opt], module)
     except RuntimeError as e:
+        if "Unknown command line argument" in str(e):
+            raise RuntimeError(
+                f"{triton_opt} does not register --convert-triton-to-smt; "
+                "build triton-opt from a tree containing the TritonToSMT "
+                "pass") from e
         return EquivalenceResult("UNSUPPORTED", "n/a", "n/a", "", str(e))
-    smtlib = _run([mlir_translate, "--export-smtlib"], smt_mlir)
+    # The exporter's input is pass output, so a failure here is an environment
+    # error (typically an mlir-translate without scripts/patches/
+    # mlir-smt-real.patch); raise it with an actionable message.
+    try:
+        smtlib = _run([mlir_translate, "--export-smtlib"], smt_mlir)
+    except RuntimeError as e:
+        if "smt.real" in str(e):
+            raise RuntimeError(
+                f"{mlir_translate} cannot handle the SMT Real sort; apply "
+                "scripts/patches/mlir-smt-real.patch (see "
+                "scripts/build-llvm-project.sh) and rebuild") from e
+        raise
 
     # Solve first without (get-model): scope 0 = addressing, scope 1 = equivalence.
     # A solver timeout is a documented UNKNOWN, not an exception.
@@ -212,8 +285,11 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
             model_query = smtlib[:end] + "\n(get-model)" + smtlib[end:]
             try:
                 z3_out = _run([z3, "-in"], model_query, timeout=timeout)
-            except subprocess.TimeoutExpired:
-                pass  # keep the verdict; the model is best-effort
+            except (subprocess.TimeoutExpired, RuntimeError):
+                # Keep the verdict; the model is best-effort. The rerun can
+                # nondeterministically flip to unknown, making z3 exit nonzero
+                # on (get-model) ("model is not available").
+                pass
     return EquivalenceResult(verdict, addr, equiv, smtlib, z3_out)
 
 

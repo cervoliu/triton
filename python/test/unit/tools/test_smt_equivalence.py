@@ -11,11 +11,31 @@ from triton.tools import smt_equivalence as tv
 
 
 def _tools_available() -> bool:
+    import subprocess
     try:
-        tv.default_triton_opt()
-        tv.default_mlir_translate()
+        triton_opt = tv.default_triton_opt()
+        mlir_translate = tv.default_mlir_translate()
         tv.default_z3()
-        return True
+    except Exception:
+        return False
+    # The binaries existing is not enough: triton-opt must register the pass
+    # (a triton-opt built from main would make every rejection test pass
+    # vacuously) and mlir-translate must carry the SMT Real-sort patch.
+    try:
+        r = subprocess.run([triton_opt, "--convert-triton-to-smt"],
+                           input="module {}\n", capture_output=True, text=True,
+                           timeout=60)
+        if "Unknown command line argument" in r.stderr:
+            return False
+        probe = ('module {\n'
+                 '  smt.solver() : () -> () {\n'
+                 '    %r = smt.declare_fun "probe" : !smt.real\n'
+                 '    smt.yield\n'
+                 '  }\n'
+                 '}\n')
+        r = subprocess.run([mlir_translate, "--export-smtlib"], input=probe,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode == 0
     except Exception:
         return False
 
