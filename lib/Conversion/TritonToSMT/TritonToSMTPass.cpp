@@ -40,6 +40,7 @@
 #include "llvm/ADT/TypeSwitch.h"
 
 #include <cmath>
+#include <functional>
 
 namespace mlir::triton {
 #define GEN_PASS_DEF_CONVERTTRITONTOSMT
@@ -125,17 +126,37 @@ static void fillCheckRegions(OpBuilder &builder, Location loc,
   }
 }
 
-// An encoded Triton SSA value: a plain SMT value, or a pointer (memory array +
-// bit-vector offset). The array symbol identifies which output buffer is meant.
+// An encoded Triton SSA value: a plain SMT value, a pointer (memory array +
+// bit-vector offset), or -- in reduction mode -- a per-lane *vector* of either
+// (see `lanes`). The array symbol identifies which output buffer is meant.
 struct EncodedValue {
-  Value value;  // plain value (null for pointers)
+  Value value;  // plain scalar value (null for pointers / vectors)
   Value array;  // pointer: the memory array symbol
-  Value offset; // pointer: the bit-vector element offset
+  Value offset; // scalar pointer: the bit-vector element offset
   bool fresh = false; // pointer: true iff no tt.addptr has been applied yet
+  // Reduction mode: a tensor materialized as N per-lane terms. For a vector
+  // *value* these are the lane SMT values (array == null); for a vector
+  // *pointer* they are the per-lane bit-vector offsets (array != null).
+  SmallVector<Value> lanes;
   bool isPtr() const { return array != nullptr; }
-  static EncodedValue plain(Value v) { return {v, nullptr, nullptr, false}; }
+  bool isVector() const { return !lanes.empty(); }
+  // Value at lane k, broadcasting a scalar operand.
+  Value laneVal(unsigned k) const { return isVector() ? lanes[k] : value; }
+  Value laneOff(unsigned k) const { return isVector() ? lanes[k] : offset; }
+  static EncodedValue plain(Value v) { return {v, nullptr, nullptr, false, {}}; }
   static EncodedValue ptr(Value a, Value o, bool fresh = false) {
-    return {nullptr, a, o, fresh};
+    return {nullptr, a, o, fresh, {}};
+  }
+  static EncodedValue vec(SmallVector<Value> ls) {
+    EncodedValue e;
+    e.lanes = std::move(ls);
+    return e;
+  }
+  static EncodedValue vecPtr(Value a, SmallVector<Value> offs) {
+    EncodedValue e;
+    e.array = a;
+    e.lanes = std::move(offs);
+    return e;
   }
 };
 
@@ -307,14 +328,57 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         << ")";
     return false;
   }
-  // Every tt.make_range must span exactly the store's lane count, or the writer
-  // decomposition (pid = i / block, lane = i % block) would misattribute lanes.
+
+  // Reduction mode: a tt.reduce collapses a block axis, so its input must be
+  // materialized as N per-lane terms rather than the single symbolic-lane term
+  // the elementwise path uses. Because floats are ideal reals, folding the N
+  // lanes in any order is provably equivalent -- no permutation/multiset
+  // machinery (as mlir-tv needs) is required. Detect it and derive the reduced
+  // extent N. See docs/smt-tv/phase-2.md.
+  bool reductionMode = false;
+  int64_t reducedN = 0;
+  for (Operation &op : entry)
+    if (auto red = dyn_cast<triton::ReduceOp>(op)) {
+      if (red->getNumOperands() != 1 || red->getNumResults() != 1) {
+        red.emitError("TritonToSMT: only single-input/single-result tt.reduce "
+                      "is supported (fused arg-reduce is rejected)");
+        return false;
+      }
+      auto srcTy = dyn_cast<RankedTensorType>(red->getOperand(0).getType());
+      if (red.getAxis() != 0 || !srcTy || srcTy.getRank() != 1 ||
+          !srcTy.hasStaticShape()) {
+        red.emitError("TritonToSMT: only axis-0 reduction of a static rank-1 "
+                      "tensor is supported");
+        return false;
+      }
+      int64_t n = srcTy.getShape()[0];
+      if (reductionMode && n != reducedN) {
+        red.emitError("TritonToSMT: all reductions in a function must share a "
+                      "single reduced extent");
+        return false;
+      }
+      reductionMode = true;
+      reducedN = n;
+    }
+  // A reduce collapses to a scalar-per-program store, so the store lane count
+  // must be 1; a tensor store coexisting with a reduce is not modeled.
+  if (reductionMode && block != 1) {
+    func.emitError("TritonToSMT: a tensor store coexisting with a reduction is "
+                   "not supported (expected a scalar store)");
+    return false;
+  }
+
+  // Every tt.make_range must span exactly the reduced extent (reduction mode)
+  // or the store's lane count (elementwise mode); otherwise the writer/lane
+  // decomposition would misattribute lanes.
+  int64_t rangeExtent = reductionMode ? reducedN : block;
   for (Operation &op : entry)
     if (auto range = dyn_cast<triton::MakeRangeOp>(op)) {
       int64_t ext = int64_t(range.getEnd()) - int64_t(range.getStart());
-      if (ext != block) {
+      if (ext != rangeExtent) {
         range.emitError("TritonToSMT: tt.make_range extent (")
-            << ext << ") does not match the store lane count (" << block << ")";
+            << ext << ") does not match the expected extent (" << rangeExtent
+            << ")";
         return false;
       }
     }
@@ -337,8 +401,217 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
     return false;
   };
 
+  // Reduction (vector) mode: encode one elementwise op at lane `k`, broadcasting
+  // scalar operands. Returns the lane result, or a null Value if `op` is not
+  // among the elementwise ops supported in vector context (the caller then
+  // rejects it). This intentionally mirrors the scalar rules in the TypeSwitch
+  // below for the subset of ops that can feed a reduction.
+  std::function<Value(Operation *, unsigned)> encodeVectorLane =
+      [&](Operation *op, unsigned k) -> Value {
+    auto A = [&](Value v) -> Value {
+      auto it = env.find(v);
+      return it == env.end() ? Value() : it->second.laneVal(k);
+    };
+    auto rcmp = [&](smt::IntPredicate p, Value x, Value y) {
+      return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
+    };
+    return llvm::TypeSwitch<Operation *, Value>(op)
+        .Case<arith::AddFOp>([&](arith::AddFOp o) {
+          return realBin(A(o.getLhs()), A(o.getRhs()), /*mul=*/false);
+        })
+        .Case<arith::SubFOp>([&](arith::SubFOp o) {
+          return smt::RealSubOp::create(b, loc, R, A(o.getLhs()), A(o.getRhs()))
+              .getResult();
+        })
+        .Case<arith::MulFOp>([&](arith::MulFOp o) {
+          return realBin(A(o.getLhs()), A(o.getRhs()), /*mul=*/true);
+        })
+        .Case<arith::NegFOp>([&](arith::NegFOp o) {
+          return smt::RealNegOp::create(b, loc, R, A(o.getOperand()))
+              .getResult();
+        })
+        .Case<arith::DivFOp>([&](arith::DivFOp o) {
+          return smt::RealDivOp::create(b, loc, R, A(o.getLhs()), A(o.getRhs()))
+              .getResult();
+        })
+        .Case<arith::MaxNumFOp, arith::MaximumFOp>([&](auto o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          return ite(rcmp(smt::IntPredicate::ge, x, y), x, y);
+        })
+        .Case<arith::MinNumFOp, arith::MinimumFOp>([&](auto o) -> Value {
+          Value x = A(o.getLhs()), y = A(o.getRhs());
+          return ite(rcmp(smt::IntPredicate::le, x, y), x, y);
+        })
+        // Integer (bit-vector) arithmetic feeding address computation. i1
+        // operands and overflow flags are rejected exactly as in the scalar
+        // rules (return null -> caller rejects).
+        .Case<arith::AddIOp>([&](arith::AddIOp o) -> Value {
+          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
+              isa<smt::BoolType>(A(o.getLhs()).getType()))
+            return Value();
+          return smt::BVAddOp::create(b, loc, A(o.getLhs()), A(o.getRhs()))
+              .getResult();
+        })
+        .Case<arith::MulIOp>([&](arith::MulIOp o) -> Value {
+          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
+              isa<smt::BoolType>(A(o.getLhs()).getType()))
+            return Value();
+          return smt::BVMulOp::create(b, loc, A(o.getLhs()), A(o.getRhs()))
+              .getResult();
+        })
+        .Case<arith::SubIOp>([&](arith::SubIOp o) -> Value {
+          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none ||
+              isa<smt::BoolType>(A(o.getLhs()).getType()))
+            return Value();
+          Value negY = smt::BVNegOp::create(b, loc, A(o.getRhs())).getResult();
+          return smt::BVAddOp::create(b, loc, A(o.getLhs()), negY).getResult();
+        })
+        .Default([&](Operation *) { return Value(); });
+  };
+
   for (Operation &opRef : entry) {
     Operation *op = &opRef;
+
+    // Reduction mode: intercept the ops that must be materialized per-lane or
+    // folded, before the scalar elementwise TypeSwitch. Everything scalar
+    // (program_id, splat, constants, post-reduce arithmetic, scalar addptr, the
+    // scalar store) still falls through to the switch below.
+    if (reductionMode) {
+      unsigned N = (unsigned)reducedN;
+      // make_range -> a concrete lane vector [start, start+N).
+      if (auto o = dyn_cast<triton::MakeRangeOp>(op)) {
+        SmallVector<Value> ls;
+        ls.reserve(N);
+        for (unsigned k = 0; k < N; ++k)
+          ls.push_back(addrConst((uint64_t)o.getStart() + k));
+        env[o.getResult()] = EncodedValue::vec(std::move(ls));
+        continue;
+      }
+      // tt.reduce.return is consumed while reading the combiner.
+      if (isa<triton::ReduceReturnOp>(op))
+        continue;
+      // tt.reduce -> fold the N input lanes with the combiner into a scalar.
+      if (auto o = dyn_cast<triton::ReduceOp>(op)) {
+        Operation *comb = o.getSingleCombiner();
+        if (!comb)
+          return err(o, "unsupported tt.reduce combiner region (non-canonical "
+                        "or fused arg-reduce)");
+        if (!isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
+                 arith::MinNumFOp, arith::MinimumFOp>(comb))
+          return err(o, "unsupported tt.reduce combiner '" +
+                            comb->getName().getStringRef() +
+                            "' (supported: addf, max/minnumf, max/minimumf)");
+        EncodedValue in = env[o->getOperand(0)];
+        if (!in.isVector() || in.lanes.size() != N)
+          return err(o, "reduction input is not a materialized lane vector");
+        // Float (ideal-real) reductions only in this milestone.
+        if (!isa<smt::RealType>(in.lanes.front().getType()))
+          return err(o, "only floating-point (real) reductions are supported");
+        auto combine = [&](Value acc, Value x) -> Value {
+          if (isa<arith::AddFOp>(comb))
+            return realBin(acc, x, /*mul=*/false);
+          smt::IntPredicate p =
+              (isa<arith::MaxNumFOp>(comb) || isa<arith::MaximumFOp>(comb))
+                  ? smt::IntPredicate::ge
+                  : smt::IntPredicate::le;
+          return ite(
+              smt::RealCmpOp::create(b, loc, Bool, p, acc, x).getResult(), acc,
+              x);
+        };
+        Value acc = in.lanes[0];
+        for (unsigned k = 1; k < N; ++k)
+          acc = combine(acc, in.lanes[k]);
+        env[o->getResult(0)] = EncodedValue::plain(acc);
+        continue;
+      }
+      // addptr with a per-lane offset (or vector base) -> vector pointer.
+      if (auto o = dyn_cast<triton::AddPtrOp>(op)) {
+        EncodedValue base = env[o.getPtr()];
+        EncodedValue off = env[o.getOffset()];
+        if (base.isVector() || off.isVector()) {
+          Type offElem = o.getOffset().getType();
+          if (auto st = dyn_cast<RankedTensorType>(offElem))
+            offElem = st.getElementType();
+          if (!offElem.isInteger(kAddrWidth))
+            return err(o, "only 32-bit pointer offsets are supported");
+          if (!base.isPtr() || !base.fresh)
+            return err(o, "vector tt.addptr requires a fresh base pointer "
+                          "(chained addptr is not supported)");
+          SmallVector<Value> offs;
+          offs.reserve(N);
+          for (unsigned k = 0; k < N; ++k)
+            offs.push_back(smt::BVAddOp::create(b, loc, base.laneOff(k),
+                                                off.laneVal(k))
+                               .getResult());
+          env[o.getResult()] = EncodedValue::vecPtr(base.array, std::move(offs));
+          continue;
+        }
+        // scalar addptr -> fall through to the existing case.
+      }
+      // load through a per-lane vector pointer -> a vector of selects.
+      if (auto o = dyn_cast<triton::LoadOp>(op)) {
+        EncodedValue p = env[o.getPtr()];
+        if (p.isVector()) {
+          if (o.getIsVolatile())
+            return err(o, "volatile loads are observable and not modeled");
+          if (o.getMask())
+            return err(o, "masked load feeding a reduction is not supported "
+                          "(masked-out lanes need the combiner identity)");
+          Type range = cast<smt::ArrayType>(p.array.getType()).getRangeType();
+          Type want = smtSortFor(elemOf(o.getType()), ctx);
+          if (!want)
+            return err(o, "unsupported loaded element type");
+          if (want != range)
+            return err(o, "load reinterprets the buffer's element sort via a "
+                          "pointer bitcast; not supported");
+          SmallVector<Value> ls;
+          ls.reserve(N);
+          for (unsigned k = 0; k < N; ++k)
+            ls.push_back(sel(p.array, p.lanes[k], range));
+          env[o.getResult()] = EncodedValue::vec(std::move(ls));
+          continue;
+        }
+        // scalar load -> fall through.
+      }
+      // tt.reshape feeding a reduction. tl.sum/tl.max emit an identity
+      // `tt.reshape allow_reorder` (N -> N) before tt.reduce. The lanes pass
+      // through unchanged: order is irrelevant because the combiner is
+      // associative+commutative over ideal reals (and allow_reorder permits any
+      // order anyway). Non-identity reshapes fall through and are rejected.
+      if (auto o = dyn_cast<triton::ReshapeOp>(op)) {
+        EncodedValue in = env[o.getSrc()];
+        auto st = dyn_cast<RankedTensorType>(o.getType());
+        if (in.isVector() && st && st.getRank() == 1 && st.hasStaticShape() &&
+            st.getShape()[0] == (int64_t)N) {
+          env[o.getResult()] = in;
+          continue;
+        }
+        // else fall through -> rejected as an unsupported vector op.
+      }
+      // Any other op with a vector operand is elementwise: encode per lane.
+      bool anyVec = false;
+      for (Value operand : op->getOperands()) {
+        auto it = env.find(operand);
+        if (it != env.end() && it->second.isVector()) {
+          anyVec = true;
+          break;
+        }
+      }
+      if (anyVec) {
+        SmallVector<Value> ls(N);
+        for (unsigned k = 0; k < N; ++k) {
+          Value r = encodeVectorLane(op, k);
+          if (!r)
+            return err(op, "operation '" + op->getName().getStringRef() +
+                               "' is not supported in reduction (vector) "
+                               "context");
+          ls[k] = r;
+        }
+        env[op->getResult(0)] = EncodedValue::vec(std::move(ls));
+        continue;
+      }
+    }
+
     bool ok =
         llvm::TypeSwitch<Operation *, bool>(op)
             .Case<triton::FuncOp, triton::ReturnOp>([&](auto) { return true; })

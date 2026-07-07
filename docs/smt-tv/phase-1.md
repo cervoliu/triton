@@ -124,7 +124,8 @@ unsupported inputs; it declines to answer.
 
 **Out of scope** (not yet encoded)
 
-- reductions / `tt.dot` (need permutation-invariant / summation encodings);
+- `tt.dot` and rank>1 / non-axis-0 reductions (1-D axis-0 `tt.reduce` with an
+  add/max/min combiner is supported as of phase 2 — see `phase-2.md`);
 - control flow: `scf.for`/`if`/`while`, loops;
 - atomics; multi-dimensional grids (`program_id` axis 1/2);
 - integer pack/unpack (blocked on `ext`/`trunc`) — the common quantization idiom.
@@ -183,9 +184,11 @@ unsupported inputs; it declines to answer.
 
 ## Roadmap
 
-ideal reals + faithful bit-vector integers (current) →
+ideal reals + faithful bit-vector integers →
+1-D `tt.reduce` add/max/min (phase 2, current) →
+`tt.dot` and multi-dim reductions →
 integer `ext`/`trunc` for quantization pack/unpack →
 multi-output / relaxed store contract →
-reductions and loops →
+loops →
 FpSan-style floating-point-error domain (reusing the same per-op dispatch and
 driver).

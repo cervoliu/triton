@@ -263,6 +263,122 @@ def test_not_equivalent_counterexample():
     assert "define-fun" in res.z3_output  # model was produced
 
 
+# --- Phase 2, milestone 1: 1-D tt.reduce (add / max / min). Because floats are
+#     ideal reals, folding the block lanes in any order is provably equivalent,
+#     so reassociations validate without permutation/multiset machinery. ---
+
+@triton.jit
+def red_sum_of_add(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offs)
+    b = tl.load(b_ptr + offs)
+    tl.store(out_ptr + tl.program_id(0), tl.sum(a + b))
+
+
+@triton.jit
+def red_add_of_sums(a_ptr, b_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    a = tl.load(a_ptr + offs)
+    b = tl.load(b_ptr + offs)
+    tl.store(out_ptr + tl.program_id(0), tl.sum(a) + tl.sum(b))
+
+
+@triton.jit
+def red_scaled_sum(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(out_ptr + tl.program_id(0), 2.0 * tl.sum(x))
+
+
+@triton.jit
+def red_sum_scaled(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(out_ptr + tl.program_id(0), tl.sum(x + x))
+
+
+@triton.jit
+def red_sum(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out_ptr + tl.program_id(0), tl.sum(tl.load(x_ptr + offs)))
+
+
+@triton.jit
+def red_max(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out_ptr + tl.program_id(0), tl.max(tl.load(x_ptr + offs)))
+
+
+@triton.jit
+def red_sum_plus_one(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    tl.store(out_ptr + tl.program_id(0), tl.sum(tl.load(x_ptr + offs)) + 1.0)
+
+
+@triton.jit
+def red_argmax(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    x = tl.load(x_ptr + offs)
+    tl.store(out_ptr + tl.program_id(0), tl.argmax(x, axis=0).to(tl.float32))
+
+
+@triton.jit
+def red_sum_2d(x_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    # A rank-2, axis-1 reduction -- outside the 1-D milestone contract.
+    rows = tl.arange(0, BLOCK)[:, None]
+    cols = tl.arange(0, BLOCK)[None, :]
+    x = tl.load(x_ptr + rows * BLOCK + cols)
+    tl.store(out_ptr + tl.arange(0, BLOCK), tl.sum(x, axis=1))
+
+
+_SR2 = {"a_ptr": PTR, "b_ptr": PTR, "out_ptr": PTR, "n": "i32",
+        "BLOCK": "constexpr"}
+_SR1 = {"x_ptr": PTR, "out_ptr": PTR, "n": "i32", "BLOCK": "constexpr"}
+_CX = {"BLOCK": 4}
+
+# (id, src_fn, tgt_fn, signature)
+REDUCE_EQUIVALENT_CASES = [
+    ("sum_of_add_vs_add_of_sums", red_sum_of_add, red_add_of_sums, _SR2),
+    ("scaled_sum_vs_sum_scaled", red_scaled_sum, red_sum_scaled, _SR1),
+    ("max_is_reflexive", red_max, red_max, _SR1),
+]
+
+
+@pytest.mark.parametrize("name,src,tgt,sig", REDUCE_EQUIVALENT_CASES,
+                         ids=[c[0] for c in REDUCE_EQUIVALENT_CASES])
+def test_reduce_equivalent(name, src, tgt, sig):
+    res = tv.check_kernels(src, tgt, sig, src_constexprs=_CX,
+                           tgt_constexprs=_CX)
+    assert res.equivalent, f"{name}: {res.verdict} (z3={res.equivalence_status})"
+
+
+def test_reduce_sum_vs_max_not_equivalent():
+    res = tv.check_kernels(red_sum, red_max, _SR1, src_constexprs=_CX,
+                           tgt_constexprs=_CX, counterexample=True)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict,
+                                             res.equivalence_status)
+
+
+def test_reduce_sum_vs_sum_plus_one_not_equivalent():
+    res = tv.check_kernels(red_sum, red_sum_plus_one, _SR1, src_constexprs=_CX,
+                           tgt_constexprs=_CX)
+    assert res.verdict == "NOT_EQUIVALENT", res.verdict
+
+
+def test_reject_fused_arg_reduce():
+    # argmax lowers to a two-result tt.reduce; getSingleCombiner() is null.
+    res = tv.check_kernels(red_argmax, red_argmax, _SR1, src_constexprs=_CX,
+                           tgt_constexprs=_CX)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_multidim_reduce():
+    # Only axis-0, rank-1 reductions are supported in this milestone.
+    res = tv.check_kernels(red_sum_2d, red_sum_2d, _SR1, src_constexprs=_CX,
+                           tgt_constexprs=_CX)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
 # --- Adversarial regression tests for the soundness review (inline TTIR so the
 #     exact patterns are exercised regardless of frontend lowering). ---
 
@@ -653,3 +769,57 @@ def test_nonfinite_timeout_is_unknown():
     for t in (float("nan"), float("inf"), 1e10):
         res = tv.check_equivalence(_STORE_ZERO, _STORE_ZERO, timeout=t)
         assert res.verdict in ("UNKNOWN", "EQUIVALENT"), (t, res.verdict)
+
+
+# --- Phase-2 reduction rejections (inline TTIR: exact patterns regardless of
+#     frontend lowering). ---
+
+# A rank-1 reduction whose combiner is *product* (arith.mulf) -- not in the
+# supported combiner set {addf, max/minnumf, max/minimumf}; must be rejected.
+_RED_MUL = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>, %n: i32) {
+    %pid = tt.get_program_id x : i32
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %pp = tt.addptr %sp, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %pp : tensor<4x!tt.ptr<f32>>
+    %s = "tt.reduce"(%v) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %c = arith.mulf %a, %b : f32
+      tt.reduce.return %c : f32
+    }) : (tensor<4xf32>) -> f32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %s : !tt.ptr<f32>
+    tt.return
+  }""")
+
+# A masked vector load feeding a reduction: masked-out lanes would need the
+# combiner identity as `other`; rejected in this milestone.
+_RED_MASKED = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>, %n: i32) {
+    %pid = tt.get_program_id x : i32
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %pp = tt.addptr %sp, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %mask = arith.constant dense<true> : tensor<4xi1>
+    %other = arith.constant dense<0.000000e+00> : tensor<4xf32>
+    %v = tt.load %pp, %mask, %other : tensor<4x!tt.ptr<f32>>
+    %s = "tt.reduce"(%v) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %c = arith.addf %a, %b : f32
+      tt.reduce.return %c : f32
+    }) : (tensor<4xf32>) -> f32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %s : !tt.ptr<f32>
+    tt.return
+  }""")
+
+
+def test_reject_unsupported_reduce_combiner():
+    res = tv.check_equivalence(_RED_MUL, _RED_MUL)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_masked_load_feeding_reduce():
+    res = tv.check_equivalence(_RED_MASKED, _RED_MASKED)
+    assert res.verdict == "UNSUPPORTED", res.verdict
