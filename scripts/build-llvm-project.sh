@@ -62,6 +62,25 @@ fi
 echo "Resetting to $LLVM_COMMIT_HASH"
 git -C "$LLVM_PROJECT_PATH" fetch origin "$LLVM_COMMIT_HASH"
 git -C "$LLVM_PROJECT_PATH" reset --hard "$LLVM_COMMIT_HASH"
+# `git reset --hard` reverts tracked edits but leaves untracked files behind
+# (e.g. SMTRealOps.td created by the patch on a previous run), which would make
+# `git apply` fail the second time. Drop them so patch application is idempotent.
+git -C "$LLVM_PROJECT_PATH" clean -fdq
+
+# Apply Triton-local MLIR patches on top of the pinned revision. These carry
+# changes that are not (yet) upstream in the pinned LLVM but are required to
+# build Triton -- e.g. the SMT dialect `Real` sort used by the TritonToSMT
+# translation-validation pass (scripts/patches/mlir-smt-real.patch). Because the
+# reset above wipes any local edits, the patch must be (re)applied on every build.
+for patch in "$REPO_ROOT"/scripts/patches/*.patch; do
+    [ -e "$patch" ] || continue
+    echo "Applying MLIR patch $(basename "$patch")"
+    git -C "$LLVM_PROJECT_PATH" apply "$patch" || {
+        echo "ERROR: failed to apply $patch" >&2
+        exit 1
+    }
+done
+
 echo "Configuring with ${CMAKE_ARGS[@]}"
 cmake "${CMAKE_ARGS[@]}"
 echo "Building LLVM"

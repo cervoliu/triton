@@ -1,3 +1,4 @@
 add_subdirectory(TritonToTritonGPU)
+add_subdirectory(TritonToSMT)
 add_subdirectory(TritonGPUToLLVM)
 add_subdirectory(TritonInstrumentToLLVM)

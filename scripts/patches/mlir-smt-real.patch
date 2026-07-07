@@ -1,0 +1,280 @@
+diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMT.td b/mlir/include/mlir/Dialect/SMT/IR/SMT.td
+index 6d0e0532e..78b137821 100644
+--- a/mlir/include/mlir/Dialect/SMT/IR/SMT.td
++++ b/mlir/include/mlir/Dialect/SMT/IR/SMT.td
+@@ -18,5 +18,6 @@ include "mlir/Dialect/SMT/IR/SMTOps.td"
+ include "mlir/Dialect/SMT/IR/SMTArrayOps.td"
+ include "mlir/Dialect/SMT/IR/SMTBitVectorOps.td"
+ include "mlir/Dialect/SMT/IR/SMTIntOps.td"
++include "mlir/Dialect/SMT/IR/SMTRealOps.td"
+ 
+ #endif // MLIR_DIALECT_SMT_IR_SMT_TD
+diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMTRealOps.td b/mlir/include/mlir/Dialect/SMT/IR/SMTRealOps.td
+new file mode 100644
+index 000000000..ff397fee1
+--- /dev/null
++++ b/mlir/include/mlir/Dialect/SMT/IR/SMTRealOps.td
+@@ -0,0 +1,104 @@
++//===- SMTRealOps.td - SMT dialect real theory operations --*- tablegen -*-===//
++//
++// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
++// See https://llvm.org/LICENSE.txt for license information.
++// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
++//
++//===----------------------------------------------------------------------===//
++
++#ifndef MLIR_DIALECT_SMT_IR_SMTREALOPS_TD
++#define MLIR_DIALECT_SMT_IR_SMTREALOPS_TD
++
++include "mlir/Dialect/SMT/IR/SMTDialect.td"
++include "mlir/Dialect/SMT/IR/SMTTypes.td"
++include "mlir/IR/EnumAttr.td"
++include "mlir/IR/OpAsmInterface.td"
++include "mlir/Interfaces/SideEffectInterfaces.td"
++
++// Note: `SMTOp` is defined in SMTOps.td and `IntPredicate` in SMTIntOps.td, both
++// of which are included before this file by SMT.td.
++
++class SMTRealOp<string mnemonic, list<Trait> traits = []> :
++  SMTOp<"real." # mnemonic, traits>;
++
++def RealConstantOp : SMTRealOp<"constant", [Pure]> {
++  let summary = "produce a constant real";
++  let description = [{
++    This operation represents a constant of the `Real` sort as described in the
++    [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of the
++    SMT-LIB 2.7 standard. The `value` attribute holds the constant already
++    rendered as an SMT-LIB real term (e.g. `0.0`, `2.0`, `(- 1.0)`, `(/ 1 3)`),
++    which is emitted verbatim during SMT-LIB export.
++
++    Example:
++    ```mlir
++    %c = smt.real.constant "0.0" : !smt.real
++    ```
++  }];
++
++  let arguments = (ins StrAttr:$value);
++  let results = (outs RealType:$result);
++  let assemblyFormat = "$value attr-dict";
++}
++
++class VariadicRealOp<string mnemonic> : SMTRealOp<mnemonic, [Pure, Commutative]> {
++  let description = [{
++    This operation represents }] # summary # [{. The semantics are equivalent to
++    the corresponding operator described in the
++    [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of the
++    SMT-LIB 2.7 standard.
++  }];
++
++  let arguments = (ins Variadic<RealType>:$inputs);
++  let results = (outs RealType:$result);
++  let assemblyFormat = "$inputs attr-dict";
++}
++
++class BinaryRealOp<string mnemonic> : SMTRealOp<mnemonic, [Pure]> {
++  let description = [{
++    This operation represents }] # summary # [{. The semantics are equivalent to
++    the corresponding operator described in the
++    [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of the
++    SMT-LIB 2.7 standard.
++  }];
++
++  let arguments = (ins RealType:$lhs, RealType:$rhs);
++  let results = (outs RealType:$result);
++  let assemblyFormat = "$lhs `,` $rhs attr-dict";
++}
++
++def RealAddOp : VariadicRealOp<"add"> { let summary = "real addition"; }
++def RealMulOp : VariadicRealOp<"mul"> { let summary = "real multiplication"; }
++def RealSubOp : BinaryRealOp<"sub"> { let summary = "real subtraction"; }
++def RealDivOp : BinaryRealOp<"div"> { let summary = "real division"; }
++
++def RealNegOp : SMTRealOp<"neg", [Pure, SameOperandsAndResultType]> {
++  let summary = "real unary negation";
++  let description = [{
++    This operation represents the unary minus of the `Real` sort as described in
++    the [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of
++    the SMT-LIB 2.7 standard.
++  }];
++
++  let arguments = (ins RealType:$input);
++  let results = (outs RealType:$result);
++  let assemblyFormat = "$input attr-dict";
++}
++
++def RealCmpOp : SMTRealOp<"cmp", [Pure, SameTypeOperands]> {
++  let summary = "real comparison";
++  let description = [{
++    This operation represents the comparison of reals. The semantics are
++    equivalent to the `<= (le)`, `< (lt)`, `>= (ge)`, or `> (gt)` operator
++    depending on the predicate (indicated in parentheses), as described in the
++    [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of the
++    SMT-LIB 2.7 standard. The `IntPredicate` enum is reused since the ordered
++    comparison predicates are identical.
++  }];
++
++  let arguments = (ins IntPredicate:$pred, RealType:$lhs, RealType:$rhs);
++  let results = (outs BoolType:$result);
++  let assemblyFormat = "$pred $lhs `,` $rhs attr-dict";
++}
++
++#endif // MLIR_DIALECT_SMT_IR_SMTREALOPS_TD
+diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMTTypes.td b/mlir/include/mlir/Dialect/SMT/IR/SMTTypes.td
+index b22fb0a6e..8e809a8ca 100644
+--- a/mlir/include/mlir/Dialect/SMT/IR/SMTTypes.td
++++ b/mlir/include/mlir/Dialect/SMT/IR/SMTTypes.td
+@@ -29,6 +29,18 @@ def IntType : SMTTypeDef<"Int"> {
+   let assemblyFormat = "";
+ }
+ 
++def RealType : SMTTypeDef<"Real"> {
++  let mnemonic = "real";
++  let description = [{
++    This type represents the `Real` sort as described in the
++    [SMT Reals theory](https://smtlib.cs.uiowa.edu/Theories/Reals.smt2) of the
++    SMT-LIB 2.7 standard. It models mathematical (ideal) real numbers, which is
++    useful for reasoning about floating-point computations under real-number
++    semantics rather than bit-precise IEEE-754.
++  }];
++  let assemblyFormat = "";
++}
++
+ def BitVectorType : SMTTypeDef<"BitVector"> {
+   let mnemonic = "bv";
+   let description = [{
+diff --git a/mlir/include/mlir/Dialect/SMT/IR/SMTVisitors.h b/mlir/include/mlir/Dialect/SMT/IR/SMTVisitors.h
+index e6b1fe8e7..fc576ded8 100644
+--- a/mlir/include/mlir/Dialect/SMT/IR/SMTVisitors.h
++++ b/mlir/include/mlir/Dialect/SMT/IR/SMTVisitors.h
+@@ -40,6 +40,9 @@ public:
+             // Int arithmetic
+             IntAddOp, IntMulOp, IntSubOp, IntDivOp, IntModOp, IntCmpOp,
+             Int2BVOp,
++            // Real arithmetic
++            RealConstantOp, RealAddOp, RealMulOp, RealSubOp, RealDivOp,
++            RealNegOp, RealCmpOp,
+             // Core Ops
+             EqOp, DistinctOp, IteOp,
+             // Variable/symbol declaration
+@@ -118,6 +121,15 @@ public:
+   HANDLE(IntCmpOp, Unhandled);
+   HANDLE(Int2BVOp, Unhandled);
+ 
++  // Real arithmetic
++  HANDLE(RealConstantOp, Unhandled);
++  HANDLE(RealAddOp, Unhandled);
++  HANDLE(RealMulOp, Unhandled);
++  HANDLE(RealSubOp, Unhandled);
++  HANDLE(RealDivOp, Unhandled);
++  HANDLE(RealNegOp, Unhandled);
++  HANDLE(RealCmpOp, Unhandled);
++
+   HANDLE(EqOp, Unhandled);
+   HANDLE(DistinctOp, Unhandled);
+   HANDLE(IteOp, Unhandled);
+@@ -161,8 +173,8 @@ public:
+   ResultType dispatchSMTTypeVisitor(Type type, ExtraArgs... args) {
+     auto *thisCast = static_cast<ConcreteType *>(this);
+     return TypeSwitch<Type, ResultType>(type)
+-        .template Case<BoolType, IntType, BitVectorType, ArrayType, SMTFuncType,
+-                       SortType>([&](auto expr) -> ResultType {
++        .template Case<BoolType, IntType, RealType, BitVectorType, ArrayType,
++                       SMTFuncType, SortType>([&](auto expr) -> ResultType {
+           return thisCast->visitSMTType(expr, args...);
+         })
+         .Default([&](auto expr) -> ResultType {
+@@ -187,6 +199,7 @@ public:
+ 
+   HANDLE(BoolType, Unhandled);
+   HANDLE(IntegerType, Unhandled);
++  HANDLE(RealType, Unhandled);
+   HANDLE(BitVectorType, Unhandled);
+   HANDLE(ArrayType, Unhandled);
+   HANDLE(SMTFuncType, Unhandled);
+diff --git a/mlir/lib/Dialect/SMT/IR/SMTTypes.cpp b/mlir/lib/Dialect/SMT/IR/SMTTypes.cpp
+index d9baef98a..b0d69353b 100644
+--- a/mlir/lib/Dialect/SMT/IR/SMTTypes.cpp
++++ b/mlir/lib/Dialect/SMT/IR/SMTTypes.cpp
+@@ -46,7 +46,7 @@ bool smt::isAnyNonFuncSMTValueType(Type type) {
+ }
+ 
+ bool smt::isAnySMTValueType(Type type) {
+-  return isa<BoolType, BitVectorType, ArrayType, IntType, SortType,
++  return isa<BoolType, BitVectorType, ArrayType, IntType, RealType, SortType,
+              SMTFuncType>(type);
+ }
+ 
+diff --git a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
+index 189f766c4..d637345fd 100644
+--- a/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
++++ b/mlir/lib/Target/SMTLIB/ExportSMTLIB.cpp
+@@ -47,6 +47,10 @@ struct TypeVisitor : public smt::SMTTypeVisitor<TypeVisitor, void,
+     stream << "Int";
+   }
+ 
++  void visitSMTType(RealType type, mlir::raw_indented_ostream &stream) {
++    stream << "Real";
++  }
++
+   void visitSMTType(BitVectorType type, mlir::raw_indented_ostream &stream) {
+     stream << "(_ BitVec " << type.getWidth() << ")";
+   }
+@@ -267,6 +271,34 @@ struct ExpressionVisitor
+     return failure();
+   }
+ 
++  //===--------------------------------------------------------------------===//
++  // Real theory operation visitors
++  //===--------------------------------------------------------------------===//
++
++  HANDLE_OP(RealAddOp, "+", Variadic);
++  HANDLE_OP(RealMulOp, "*", Variadic);
++  HANDLE_OP(RealSubOp, "-", Binary);
++  HANDLE_OP(RealDivOp, "/", Binary);
++
++  LogicalResult visitSMTOp(RealNegOp op, VisitorInfo &info) {
++    info.stream << "(- " << info.valueMap.lookup(op.getInput()) << ")";
++    return success();
++  }
++
++  LogicalResult visitSMTOp(RealCmpOp op, VisitorInfo &info) {
++    switch (op.getPred()) {
++    case IntPredicate::ge:
++      return printBinaryOp(op, ">=", info);
++    case IntPredicate::le:
++      return printBinaryOp(op, "<=", info);
++    case IntPredicate::gt:
++      return printBinaryOp(op, ">", info);
++    case IntPredicate::lt:
++      return printBinaryOp(op, "<", info);
++    }
++    return failure();
++  }
++
+   //===--------------------------------------------------------------------===//
+   // Core theory operation visitors
+   //===--------------------------------------------------------------------===//
+@@ -525,6 +557,23 @@ struct StatementVisitor
+     return success();
+   }
+ 
++  LogicalResult visitSMTOp(RealConstantOp op, mlir::raw_indented_ostream &stream,
++                           ValueMap &valueMap) {
++    // The attribute holds an SMT-LIB real term emitted verbatim. Guard against
++    // injection: a real literal is a single closed term over digits, '.', '/',
++    // unary '-', parentheses and spaces. Anything else (letters, newlines, or
++    // embedded SMT commands) is rejected so a crafted constant cannot forge
++    // solver output.
++    StringRef value = op.getValue();
++    if (value.empty() ||
++        value.find_first_not_of("0123456789./- ()\t") != StringRef::npos)
++      return op.emitError(
++                 "smt.real.constant value is not a valid real literal: ")
++             << value;
++    valueMap.insert(op.getResult(), value.str());
++    return success();
++  }
++
+   LogicalResult visitSMTOp(DeclareFunOp op, mlir::raw_indented_ostream &stream,
+                            ValueMap &valueMap) {
+     StringRef name =
