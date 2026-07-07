@@ -32,6 +32,10 @@ without tools, and skipped soundness tests look identical to passing ones.
 - lit only: `.llvm-project/build/bin/llvm-lit -sv build/cmake.*/test/Conversion --filter triton_to_smt`
 - pytest only: `cd python && ../.venv/bin/python -m pytest test/unit/tools/test_smt_equivalence.py`
 
+Adversarial soundness reviews go to the external Codex reviewer via the Codex
+plugin (`/codex:rescue`), using the brief in `docs/smt-tv/review-prompt.md` —
+there is no shell wrapper for this.
+
 ## Rules
 
 - **Soundness first:** the pass must REJECT (`signalPassFailure`) anything

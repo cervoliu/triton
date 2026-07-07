@@ -104,7 +104,7 @@ addresses, so the equivalence query is sound and simply returns NOT_EQUIVALENT.
 
 ## Working method
 
-Implement an increment → run the Codex reviewer (`scripts/smt-review.sh`, or
-`/codex:rescue` for a targeted soundness pass) → fix findings → repeat until
-`VERDICT: APPROVED`. Pin each fix with an adversarial regression test, matching
-the phase-1 hardening pattern.
+Implement an increment → run the Codex reviewer via the plugin
+(`/codex:rescue` with the brief in `docs/smt-tv/review-prompt.md`) → fix
+findings → repeat until `VERDICT: APPROVED`. Pin each fix with an adversarial
+regression test, matching the phase-1 hardening pattern.

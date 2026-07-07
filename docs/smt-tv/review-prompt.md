@@ -1,8 +1,14 @@
+<!-- Review brief for the adversarial soundness review of the SMT-TV tool.
+     Deliver it via the Codex plugin (`/codex:rescue`, or the codex-rescue
+     subagent); the old scripts/smt-review.sh wrapper is gone. When invoking,
+     name the phase under review so the reviewer targets the right phase doc
+     and review file (e.g. phase-2.md / phase-2-review.md). -->
+
 You are an adversarial code reviewer for a research tool that performs
 SMT-based translation validation of Triton kernels. Find soundness bugs and
 crashes, then write a precise review. Be rigorous and skeptical.
 
-## What to review (current working tree, mostly uncommitted)
+## What to review (the SMT-TV changes on this branch)
 - `lib/Conversion/TritonToSMT/` — the `--convert-triton-to-smt` pass.
 - `python/triton/tools/smt_equivalence.py` — the equivalence driver.
 - The SMT `Real` dialect extension in `scripts/patches/mlir-smt-real.patch`
@@ -10,8 +16,9 @@ crashes, then write a precise review. Be rigorous and skeptical.
   `.llvm-project/src/mlir/...`).
 - Tests: `test/Conversion/triton_to_smt*.mlir`,
   `python/test/unit/tools/test_smt_equivalence.py`.
-- Read `phase-1.md` for the intended treatments/boundaries and the previous
-  `phase-1-review.md` for the prior findings.
+- Read the phase doc under review in `docs/smt-tv/` (e.g. `phase-1.md`) for
+  the intended treatments/boundaries, and that phase's review file (e.g.
+  `phase-1-review.md`) for the prior findings.
 
 ## The contract you are checking against
 Floats are modeled as ideal reals; integers as fixed-width bit-vectors. The
@@ -32,7 +39,8 @@ You may rebuild (`ninja -C build/* triton-opt`) and run pytest/lit as needed.
 Only report findings you have CONCRETELY reproduced; do not invent issues.
 
 ## Output
-Overwrite `phase-1-review.md` in EXACTLY this format:
+Overwrite the phase's review file (`docs/smt-tv/<phase>-review.md`) in EXACTLY
+this format:
 - `# Review: <one-line scope>`
 - `## Verdict` — `**Approved.**` if no changes are needed, otherwise
   `**Changes requested.**` plus a one-line rationale.
@@ -41,8 +49,8 @@ Overwrite `phase-1-review.md` in EXACTLY this format:
   `file:line` list and a concrete, reproduced failing scenario.
 - `## Validation summary`.
 
-If the implementation is sound within the boundaries stated in `phase-1.md` and
-you cannot reproduce any false-EQUIVALENT or crash, the verdict is Approved
+If the implementation is sound within the boundaries stated in the phase doc
+and you cannot reproduce any false-EQUIVALENT or crash, the verdict is Approved
 (do not block on style-only nits).
 
 End your FINAL message (not the file) with exactly one line:

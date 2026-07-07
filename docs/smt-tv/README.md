@@ -24,8 +24,11 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
 
 ## Review harness
 
-The Codex review loop lives in `scripts/`: `scripts/smt-review.sh` (runs the
-external reviewer) and `scripts/smt-review-prompt.md` (its prompt).
+Reviews are delivered to the external Codex reviewer through the Codex plugin
+(`/codex:rescue`, or the codex-rescue subagent) using the brief in
+[`review-prompt.md`](review-prompt.md). The loop: implement an increment →
+send the brief (naming the phase under review) → fix findings → repeat until
+`VERDICT: APPROVED`, pinning each fix with an adversarial regression test.
 
 ## Verification & patch tooling
 
