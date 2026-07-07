@@ -13,8 +13,7 @@ fixed-width-integer" posture from phase 1 (`phase-1.md`).
 2. **Shifts + integer `ext`/`trunc`** via a per-op **well-definedness flag**
    (adopt mlir-tv's `wellDefined(op, cond)` — UB as a boolean conjunct — instead
    of rejecting outright). Unblocks the common quantization pack/unpack idiom.
-3. **Directional refinement** (`src ⊑ tgt`) + NaN-aware compare — only when/if we
-   move toward IEEE-faithfulness (a separate, larger direction).
+3. **Directional refinement** (`src ⊑ tgt`). Treat equivalence as bidirectional refinement. 
 4. **Validation-methodology reuse** — run the validator across Triton's own
    lowering-pass tests, mirroring how mlir-tv validated MLIR's 2,467 unit-test
    pairs and found real spec bugs.

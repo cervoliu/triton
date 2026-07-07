@@ -899,3 +899,191 @@ def test_reject_reshape_reorder_feeding_elementwise():
     res = tv.check_equivalence(_RED_RESHAPE_REORDER_ELEMENTWISE,
                                _RED_RESHAPE_REORDER_ELEMENTWISE)
     assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+# --- Phase-2 milestone 2: shifts + integer ext/trunc with solver-discharged
+#     well-definedness (mlir-tv's wellDefined(op, cond) as a dedicated scope).
+#     Inline TTIR: scalar i32 kernels that load x from %a and store an i32. ---
+
+def _i32_kernel(compute: str, result: str) -> str:
+    """A scalar kernel: x = a[idx]; <compute>; o[idx] = <result> (all i32)."""
+    return _mod(f"""
+  tt.func public @k(%a: !tt.ptr<i32>, %o: !tt.ptr<i32>, %n: i32) {{
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pa = tt.addptr %a, %idx : !tt.ptr<i32>, i32
+    %x = tt.load %pa, %m, %c0 : !tt.ptr<i32>
+    {compute}
+    %po = tt.addptr %o, %idx : !tt.ptr<i32>, i32
+    tt.store %po, {result}, %m : !tt.ptr<i32>
+    tt.return
+  }}""")
+
+
+def test_shl_vs_mul_equivalent():
+    src = _i32_kernel("""%c2 = arith.constant 2 : i32
+    %r = arith.shli %x, %c2 : i32""", "%r")
+    tgt = _i32_kernel("""%c4 = arith.constant 4 : i32
+    %r = arith.muli %x, %c4 : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.wd_status, res.equivalence_status)
+    assert res.wd_status == "unsat", res.wd_status
+
+
+def test_shl_vs_mul3_not_equivalent():
+    src = _i32_kernel("""%c1 = arith.constant 1 : i32
+    %r = arith.shli %x, %c1 : i32""", "%r")
+    tgt = _i32_kernel("""%c3 = arith.constant 3 : i32
+    %r = arith.muli %x, %c3 : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.verdict == "NOT_EQUIVALENT", res.verdict
+
+
+def test_shrsi_vs_shrui_not_equivalent():
+    src = _i32_kernel("""%c1 = arith.constant 1 : i32
+    %r = arith.shrsi %x, %c1 : i32""", "%r")
+    tgt = _i32_kernel("""%c1 = arith.constant 1 : i32
+    %r = arith.shrui %x, %c1 : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.verdict == "NOT_EQUIVALENT", res.verdict
+
+
+def test_shift_by_31_boundary_equivalent():
+    k = _i32_kernel("""%c31 = arith.constant 31 : i32
+    %r = arith.shrui %x, %c31 : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.equivalent, (res.verdict, res.wd_status)
+
+
+def test_reject_shift_by_width():
+    # amt == width is poison; wd scope must be sat -> UNSUPPORTED, and two
+    # syntactically identical kernels must NOT be reported EQUIVALENT.
+    k = _i32_kernel("""%c32 = arith.constant 32 : i32
+    %r = arith.shli %x, %c32 : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.verdict == "UNSUPPORTED", (res.verdict, res.wd_status)
+    assert res.wd_status == "sat", res.wd_status
+
+
+def test_reject_unbounded_shift_amount():
+    # The shift amount is a loaded value; nothing bounds it below the width.
+    k = _i32_kernel("""%r = arith.shli %x, %x : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.verdict == "UNSUPPORTED", (res.verdict, res.wd_status)
+    assert res.wd_status == "sat", res.wd_status
+
+
+def test_masked_shift_amount_equivalent():
+    # x >> (x & 31): the mask makes well-definedness provable for all inputs --
+    # the point of solver-discharged WD over syntactic rejection.
+    k = _i32_kernel("""%c31 = arith.constant 31 : i32
+    %amt = arith.andi %x, %c31 : i32
+    %r = arith.shrui %x, %amt : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.equivalent, (res.verdict, res.wd_status)
+    assert res.wd_status == "unsat", res.wd_status
+
+
+def test_reject_shl_overflow_flags():
+    k = _i32_kernel("""%c1 = arith.constant 1 : i32
+    %r = arith.shli %x, %c1 overflow<nsw> : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_shr_exact_flag():
+    k = _i32_kernel("""%c1 = arith.constant 1 : i32
+    %r = arith.shrui %x, %c1 exact : i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_trunci_overflow_flags():
+    k = _i32_kernel("""%r32 = arith.trunci %x overflow<nsw> : i32 to i16
+    %r = arith.extui %r32 : i16 to i32""", "%r")
+    res = tv.check_equivalence(k, k)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_ext_trunc_roundtrip_equivalent():
+    # trunc(zext(x)) == x, via i16.
+    src = _i32_kernel("""%w = arith.trunci %x : i32 to i16
+    %r = arith.extui %w : i16 to i32""", "%r")
+    tgt = _i32_kernel("""%cffff = arith.constant 65535 : i32
+    %r = arith.andi %x, %cffff : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.equivalence_status)
+
+
+def test_extsi_vs_shift_pair_equivalent():
+    # sext_16_32(trunc(x)) == ashr(shl(x, 16), 16): the classic identity.
+    src = _i32_kernel("""%w = arith.trunci %x : i32 to i16
+    %r = arith.extsi %w : i16 to i32""", "%r")
+    tgt = _i32_kernel("""%c16 = arith.constant 16 : i32
+    %hi = arith.shli %x, %c16 : i32
+    %r = arith.shrsi %hi, %c16 : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.equivalence_status)
+
+
+def test_extsi_vs_extui_not_equivalent():
+    src = _i32_kernel("""%w = arith.trunci %x : i32 to i16
+    %r = arith.extsi %w : i16 to i32""", "%r")
+    tgt = _i32_kernel("""%w = arith.trunci %x : i32 to i16
+    %r = arith.extui %w : i16 to i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.verdict == "NOT_EQUIVALENT", res.verdict
+
+
+def test_trunc_to_i1_vs_lowbit_test_equivalent():
+    # trunci to i1 takes the low bit; equivalent to (x & 1) != 0. The stored
+    # sort is smt.bool via an i1 output buffer.
+    header = """  tt.func public @k(%a: !tt.ptr<i32>, %o: !tt.ptr<i1>, %n: i32) {{
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pa = tt.addptr %a, %idx : !tt.ptr<i32>, i32
+    %x = tt.load %pa, %m, %c0 : !tt.ptr<i32>
+    {compute}
+    %po = tt.addptr %o, %idx : !tt.ptr<i1>, i32
+    tt.store %po, %r, %m : !tt.ptr<i1>
+    tt.return
+  }}"""
+    src = _mod(header.format(compute="%r = arith.trunci %x : i32 to i1"))
+    tgt = _mod(header.format(compute="""%c1 = arith.constant 1 : i32
+    %lo = arith.andi %x, %c1 : i32
+    %r = arith.cmpi ne, %lo, %c0 : i32"""))
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.equivalence_status)
+
+
+# Shifts inside a reduction (vector) context: WD conditions accumulate per lane.
+_RED_SHL_ADDR = _mod("""
+  tt.func public @k(%a: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+    %pid = tt.get_program_id x : i32
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %c1 = arith.constant dense<1> : tensor<4xi32>
+    %offs = arith.shli %r, %c1 : tensor<4xi32>
+    %sp = tt.splat %a : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %pp = tt.addptr %sp, %offs : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %pp : tensor<4x!tt.ptr<f32>>
+    %s = "tt.reduce"(%v) <{axis = 0 : i32}> ({
+    ^bb0(%x: f32, %y: f32):
+      %c = arith.addf %x, %y : f32
+      tt.reduce.return %c : f32
+    }) : (tensor<4xf32>) -> f32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %s : !tt.ptr<f32>
+    tt.return
+  }""")
+_RED_MUL_ADDR = _RED_SHL_ADDR.replace(
+    "arith.shli %r, %c1", "arith.muli %r, %c2").replace(
+    "%c1 = arith.constant dense<1>", "%c2 = arith.constant dense<2>")
+
+
+def test_reduce_with_shifted_addressing_equivalent():
+    res = tv.check_equivalence(_RED_SHL_ADDR, _RED_MUL_ADDR)
+    assert res.equivalent, (res.verdict, res.wd_status,
+                            res.equivalence_status)
+    assert res.wd_status == "unsat", res.wd_status

@@ -12,15 +12,24 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
     (floating-point values are modeled as mathematical reals, not IEEE-754).
 
     Given two functions with matching signatures (a source and a target), it
-    builds a single `smt.solver` scope that declares the shared symbolic inputs,
-    encodes the value each function writes to a symbolic output index `i`, and
-    asserts that the two written values can differ. Exporting the result to
-    SMT-LIB (`mlir-translate --export-smtlib`) and running an SMT solver then
-    decides equivalence: `unsat` means the two functions are equivalent.
+    emits three `smt.solver` scopes, in fixed order, each declaring the shared
+    symbolic inputs and encoding both functions at a symbolic output index `i`:
+
+    * scope 0 (addressing): asserts a store offset can differ from `i`;
+      `unsat` proves identity addressing.
+    * scope 1 (well-definedness): asserts the negation of the conjunction of
+      all per-op well-definedness conditions (e.g. shift amount < width);
+      `unsat` proves no input reaches a poison case, so the total SMT
+      encodings are faithful. Trivially `unsat` when no such ops occur.
+    * scope 2 (equivalence): asserts the two functions' final output arrays
+      can differ; `unsat` means the functions are equivalent.
+
+    Exporting the result to SMT-LIB (`mlir-translate --export-smtlib`) and
+    running an SMT solver yields one sat/unsat/unknown line per scope.
 
     The encoding is operation-wise: every supported Triton/arith/math operation
     has its own local encoding rule. It currently targets straight-line,
-    elementwise kernels (no reductions, loops, or atomics).
+    elementwise kernels and 1-D reductions (no loops or atomics).
   }];
 
   let dependentDialects = ["mlir::arith::ArithDialect",

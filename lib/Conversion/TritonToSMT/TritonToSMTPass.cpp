@@ -18,9 +18,11 @@
 //     verified by a dedicated `smt.check` scope;
 //   * 32-bit indexing, `program_id` axis 0, matching full signatures.
 //
-// It emits two solver scopes: scope 0 checks that addressing is identity (unsat
-// => identity holds); scope 1 asserts the two functions' output arrays can
-// differ (unsat => equivalent). See Passes.td.
+// It emits three solver scopes, in fixed order: scope 0 checks that addressing
+// is identity (unsat => identity holds); scope 1 checks well-definedness
+// (unsat => no input reaches a poison case, e.g. an oversized shift, so the
+// total SMT encodings are faithful); scope 2 asserts the two functions' output
+// arrays can differ (unsat => equivalent). See Passes.td.
 //
 //===----------------------------------------------------------------------===//
 
@@ -183,11 +185,14 @@ struct ConvertTritonToSMT
                      Value &outIndex, SmallVectorImpl<EncodedValue> &outArgs);
 
   // Encode `func` at the symbolic index `iVal` using `sharedArgs`. Appends the
-  // function's stores to `stores`. Returns false (and emits an error) if the
+  // function's stores to `stores` and its per-op well-definedness conditions
+  // (Bool terms that must hold for the encoding to be faithful, e.g. shift
+  // amount < width) to `wdConds`. Returns false (and emits an error) if the
   // function uses an unsupported construct.
   bool encodeFunction(OpBuilder &b, triton::FuncOp func,
                       ArrayRef<EncodedValue> sharedArgs, Value iVal,
-                      SmallVectorImpl<StoreInfo> &stores);
+                      SmallVectorImpl<StoreInfo> &stores,
+                      SmallVectorImpl<Value> &wdConds);
 };
 
 bool ConvertTritonToSMT::declareInputs(OpBuilder &b, Location loc,
@@ -231,7 +236,8 @@ bool ConvertTritonToSMT::declareInputs(OpBuilder &b, Location loc,
 bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                                         ArrayRef<EncodedValue> sharedArgs,
                                         Value iVal,
-                                        SmallVectorImpl<StoreInfo> &stores) {
+                                        SmallVectorImpl<StoreInfo> &stores,
+                                        SmallVectorImpl<Value> &wdConds) {
   MLIRContext *ctx = &getContext();
   Location loc = func.getLoc();
   auto R = smt::RealType::get(ctx);
@@ -510,13 +516,46 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
             return smt::XOrOp::create(b, loc, x, y).getResult();
           return smt::BVXOrOp::create(b, loc, x, y).getResult();
         })
-        // Integer division, remainder, and shifts are intentionally NOT
-        // encoded. SMT bit-vector div/rem are total (e.g. bvudiv by zero is
-        // all-ones) and bv shifts are defined for oversized amounts, whereas
-        // the corresponding arith ops are undefined there. Without a
-        // definedness/poison model, encoding them as total operations is
-        // unsound (a kernel storing `1/0` would look equivalent to one storing
-        // `-1`), so they fall to Default and are rejected.
+        // Shifts. An oversized shift amount (>= width) is poison in arith but
+        // defined for the total SMT bv shifts, so each shift contributes a
+        // well-definedness condition `amt < width` (mlir-tv's wellDefined(op,
+        // cond) idea). A dedicated solver scope proves the conjunction holds
+        // for ALL inputs; if it cannot, the driver reports UNSUPPORTED -- the
+        // total encoding is only trusted when no input can reach the poison
+        // case.
+        .Case<arith::ShLIOp, arith::ShRUIOp, arith::ShRSIOp>(
+            [&](auto o) -> Value {
+              if constexpr (std::is_same_v<decltype(o), arith::ShLIOp>) {
+                if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none) {
+                  why = "arith overflow flags (nsw/nuw) are not modeled";
+                  return Value();
+                }
+              } else {
+                if (o.getIsExact()) {
+                  why = "shr exact flag introduces poison we do not model";
+                  return Value();
+                }
+              }
+              Value x = A(o.getLhs()), y = A(o.getRhs());
+              if (isa<smt::BoolType>(x.getType())) {
+                why = "i1 integer arithmetic is not supported";
+                return Value();
+              }
+              unsigned w = cast<smt::BitVectorType>(x.getType()).getWidth();
+              wdConds.push_back(
+                  bvcmp(smt::BVCmpPredicate::ult, y, bvc(APInt(w, w))));
+              if (isa<arith::ShLIOp>(o.getOperation()))
+                return smt::BVShlOp::create(b, loc, x, y).getResult();
+              if (isa<arith::ShRUIOp>(o.getOperation()))
+                return smt::BVLShrOp::create(b, loc, x, y).getResult();
+              return smt::BVAShrOp::create(b, loc, x, y).getResult();
+            })
+        // Integer division and remainder are intentionally NOT encoded. SMT
+        // bit-vector div/rem are total (e.g. bvudiv by zero is all-ones)
+        // whereas the arith ops are undefined there; unlike shifts, their
+        // well-definedness (nonzero divisor, no INT_MIN/-1) is rarely provable
+        // for all inputs, so they fall to Default and are rejected until a
+        // use case appears.
         .Case<arith::CmpIOp>([&](arith::CmpIOp o) -> Value {
           Value x = A(o.getLhs()), y = A(o.getRhs());
           using P = arith::CmpIPredicate;
@@ -535,20 +574,55 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           }
           llvm_unreachable("covered switch");
         })
-        // Casts. Only the bool-to-storage idioms are encoded: comparison
-        // results (i1) widened for storing as bytes or floats. All other
-        // width- or domain-changing casts remain rejected.
+        // Integer width casts. i1 sources/results map to/from smt.bool; wider
+        // widths are pure bit-vector zext/sext/truncate, which are total (no
+        // well-definedness condition needed) once their poison flags are
+        // rejected.
         .Case<arith::ExtUIOp>([&](arith::ExtUIOp o) -> Value {
           if (o.getNonNeg()) {
             why = "extui nneg flag introduces poison we do not model";
             return Value();
           }
-          if (!elemOf(o.getIn().getType()).isInteger(1)) {
-            why = "only i1 sources are supported for extui";
+          unsigned dw = elemOf(o.getType()).getIntOrFloatBitWidth();
+          if (elemOf(o.getIn().getType()).isInteger(1))
+            return ite(A(o.getIn()), bvc(APInt(dw, 1)), bvc(APInt(dw, 0)));
+          Value x = A(o.getIn());
+          unsigned sw = cast<smt::BitVectorType>(x.getType()).getWidth();
+          // zext = concat(0^{dw-sw}, x)
+          return smt::ConcatOp::create(b, loc, bvc(APInt(dw - sw, 0)), x)
+              .getResult();
+        })
+        .Case<arith::ExtSIOp>([&](arith::ExtSIOp o) -> Value {
+          unsigned dw = elemOf(o.getType()).getIntOrFloatBitWidth();
+          if (elemOf(o.getIn().getType()).isInteger(1))
+            return ite(A(o.getIn()), bvc(APInt::getAllOnes(dw)),
+                       bvc(APInt(dw, 0)));
+          Value x = A(o.getIn());
+          unsigned sw = cast<smt::BitVectorType>(x.getType()).getWidth();
+          // sext = ite(x <s 0, concat(1^{dw-sw}, x), concat(0^{dw-sw}, x))
+          Value isNeg = bvcmp(smt::BVCmpPredicate::slt, x, bvc(APInt(sw, 0)));
+          Value hi = ite(isNeg, bvc(APInt::getAllOnes(dw - sw)),
+                         bvc(APInt(dw - sw, 0)));
+          return smt::ConcatOp::create(b, loc, hi, x).getResult();
+        })
+        .Case<arith::TruncIOp>([&](arith::TruncIOp o) -> Value {
+          if (o.getOverflowFlags() != arith::IntegerOverflowFlags::none) {
+            why = "arith overflow flags (nsw/nuw) are not modeled";
             return Value();
           }
-          unsigned w = elemOf(o.getType()).getIntOrFloatBitWidth();
-          return ite(A(o.getIn()), bvc(APInt(w, 1)), bvc(APInt(w, 0)));
+          Value x = A(o.getIn());
+          unsigned dw = elemOf(o.getType()).getIntOrFloatBitWidth();
+          if (dw == 1) {
+            // trunc to i1 takes the lowest bit; the result sort is smt.bool.
+            auto bit0Ty = smt::BitVectorType::get(op->getContext(), 1);
+            Value bit0 =
+                smt::ExtractOp::create(b, loc, bit0Ty, /*lowBit=*/0, x)
+                    .getResult();
+            return beq(bit0, bvc(APInt(1, 1)));
+          }
+          auto dstTy = smt::BitVectorType::get(op->getContext(), dw);
+          return smt::ExtractOp::create(b, loc, dstTy, /*lowBit=*/0, x)
+              .getResult();
         })
         .Case<arith::UIToFPOp>([&](arith::UIToFPOp o) -> Value {
           if (o.getNonNeg()) {
@@ -1000,7 +1074,9 @@ void ConvertTritonToSMT::runOnOperation() {
   OpBuilder builder(ctx);
 
   // Build one solver scope, returning the terminating check op's builder state.
-  // `mode`: 0 = addressing-identity check, 1 = equivalence check.
+  // `mode`: 0 = addressing-identity check, 1 = well-definedness check,
+  // 2 = equivalence check. All three scopes are always emitted, in this order,
+  // so the driver's scope-position contract stays fixed.
   auto buildScope = [&](int mode) -> bool {
     builder.setInsertionPointToEnd(module.getBody());
     auto solver = smt::SolverOp::create(builder, loc, TypeRange{}, ValueRange{});
@@ -1014,8 +1090,9 @@ void ConvertTritonToSMT::runOnOperation() {
       return false;
 
     SmallVector<StoreInfo> storesS, storesT;
-    if (!encodeFunction(builder, src, shared, iVal, storesS) ||
-        !encodeFunction(builder, tgt, shared, iVal, storesT))
+    SmallVector<Value> wdConds;
+    if (!encodeFunction(builder, src, shared, iVal, storesS, wdConds) ||
+        !encodeFunction(builder, tgt, shared, iVal, storesT, wdConds))
       return false;
     const StoreInfo &s = storesS.front(), &t = storesT.front();
 
@@ -1026,6 +1103,22 @@ void ConvertTritonToSMT::runOnOperation() {
       Value ds = smt::DistinctOp::create(builder, loc, s.offset, iVal).getResult();
       Value dt = smt::DistinctOp::create(builder, loc, t.offset, iVal).getResult();
       assertion = smt::OrOp::create(builder, loc, ds, dt).getResult();
+    } else if (mode == 1) {
+      // Well-definedness: assert the negation of the conjunction of all
+      // collected conditions (both functions). unsat => no input can reach a
+      // poison case (e.g. an oversized shift), so the total SMT encodings are
+      // faithful. With no conditions the scope is trivially unsat.
+      if (wdConds.empty()) {
+        assertion = smt::BoolConstantOp::create(
+                        builder, loc, smt::BoolType::get(ctx),
+                        builder.getBoolAttr(false))
+                        .getResult();
+      } else {
+        Value conj = wdConds.front();
+        for (size_t k = 1; k < wdConds.size(); ++k)
+          conj = smt::AndOp::create(builder, loc, conj, wdConds[k]).getResult();
+        assertion = smt::NotOp::create(builder, loc, conj).getResult();
+      }
     } else {
       // Compare the final state of every written output array at index i.
       auto finalOf = [&](const StoreInfo &st, Value arr) -> Value {
@@ -1063,7 +1156,8 @@ void ConvertTritonToSMT::runOnOperation() {
     return true;
   };
 
-  if (!buildScope(/*addressing=*/0) || !buildScope(/*equivalence=*/1))
+  if (!buildScope(/*addressing=*/0) || !buildScope(/*well-definedness=*/1) ||
+      !buildScope(/*equivalence=*/2))
     return signalPassFailure();
 
   // Remove all non-SMT ops so the module can be exported with mlir-translate.

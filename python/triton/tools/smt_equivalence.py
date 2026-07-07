@@ -188,6 +188,10 @@ class EquivalenceResult:
     equivalence_status: str  # z3 result of the equivalence scope
     smtlib: str
     z3_output: str
+    # z3 result of the well-definedness scope (unsat => no input can reach a
+    # poison case such as an oversized shift). Defaults to "n/a" for results
+    # produced before the solver stage.
+    wd_status: str = "n/a"
 
     @property
     def equivalent(self) -> bool:
@@ -251,25 +255,30 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
                 "scripts/build-llvm-project.sh) and rebuild") from e
         raise
 
-    # Solve first without (get-model): scope 0 = addressing, scope 1 = equivalence.
-    # A solver timeout is a documented UNKNOWN, not an exception.
+    # Solve first without (get-model): scope 0 = addressing, scope 1 =
+    # well-definedness, scope 2 = equivalence (the pass always emits all three,
+    # in this order). A solver timeout is a documented UNKNOWN, not an exception.
     try:
         z3_out = _run([z3, "-in"], smtlib, timeout=timeout)
     except (subprocess.TimeoutExpired, ValueError, OverflowError):
         # TimeoutExpired = genuine timeout; ValueError/OverflowError = a timeout
         # value subprocess cannot represent. Both are a documented UNKNOWN.
         return EquivalenceResult("UNKNOWN", "timeout", "timeout", smtlib,
-                                 f"z3 timed out or timeout unrepresentable ({timeout})")
-    # The pass emits exactly two solver scopes (addressing, then equivalence);
-    # require exactly two solver results rather than trusting line positions, so
-    # an unexpected extra scope cannot be misread as a verdict.
+                                 f"z3 timed out or timeout unrepresentable ({timeout})",
+                                 "timeout")
+    # Require exactly three solver results rather than trusting line positions,
+    # so an unexpected extra scope cannot be misread as a verdict.
     results = [ln.strip() for ln in z3_out.splitlines()
                if ln.strip() in ("sat", "unsat", "unknown")]
-    if len(results) != 2:
+    if len(results) != 3:
         return EquivalenceResult("UNKNOWN", "n/a", "n/a", smtlib, z3_out)
-    addr, equiv = results  # scope 0: addressing, scope 1: equivalence
+    addr, wd, equiv = results
     if addr == "sat":
         verdict = "UNSUPPORTED"  # non-identity addressing is not modeled
+    elif wd != "unsat" and addr == "unsat":
+        # Some input may reach a poison case (e.g. an oversized shift), so the
+        # total SMT encoding cannot be trusted; never report EQUIVALENT here.
+        verdict = "UNSUPPORTED" if wd == "sat" else "UNKNOWN"
     elif addr == "unsat":
         verdict = {"unsat": "EQUIVALENT",
                    "sat": "NOT_EQUIVALENT"}.get(equiv, "UNKNOWN")
@@ -290,7 +299,7 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
                 # nondeterministically flip to unknown, making z3 exit nonzero
                 # on (get-model) ("model is not available").
                 pass
-    return EquivalenceResult(verdict, addr, equiv, smtlib, z3_out)
+    return EquivalenceResult(verdict, addr, equiv, smtlib, z3_out, wd)
 
 
 def check_kernels(src_fn, tgt_fn, signature: dict, *,
