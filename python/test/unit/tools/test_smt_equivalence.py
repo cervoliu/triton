@@ -823,3 +823,59 @@ def test_reject_unsupported_reduce_combiner():
 def test_reject_masked_load_feeding_reduce():
     res = tv.check_equivalence(_RED_MASKED, _RED_MASKED)
     assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+# A reduce combiner region that also performs a side-effecting (volatile) load:
+# getSingleCombiner() still returns the addf, but the pass must NOT silently drop
+# the observable load. Require the region to be exactly {combine, return}.
+_RED_COMBINER_SIDE_EFFECT = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>, %n: i32) {
+    %pid = tt.get_program_id x : i32
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %pp = tt.addptr %sp, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %pp : tensor<4x!tt.ptr<f32>>
+    %s = "tt.reduce"(%v) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %junk = tt.load %x {isVolatile = true} : !tt.ptr<f32>
+      %c = arith.addf %a, %b : f32
+      tt.reduce.return %c : f32
+    }) : (tensor<4xf32>) -> f32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %s : !tt.ptr<f32>
+    tt.return
+  }""")
+
+# A `tt.reshape allow_reorder` whose result feeds lane-wise arithmetic (not the
+# reduce directly): allow_reorder leaves the element order unspecified, so the
+# identity pass-through would be unsound. Must be rejected.
+_RED_RESHAPE_REORDER_ELEMENTWISE = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>, %n: i32) {
+    %pid = tt.get_program_id x : i32
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sp = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %pp = tt.addptr %sp, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %pp : tensor<4x!tt.ptr<f32>>
+    %rs = tt.reshape %v allow_reorder : tensor<4xf32> -> tensor<4xf32>
+    %sq = arith.mulf %rs, %v : tensor<4xf32>
+    %s = "tt.reduce"(%sq) <{axis = 0 : i32}> ({
+    ^bb0(%a: f32, %b: f32):
+      %c = arith.addf %a, %b : f32
+      tt.reduce.return %c : f32
+    }) : (tensor<4xf32>) -> f32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %s : !tt.ptr<f32>
+    tt.return
+  }""")
+
+
+def test_reject_reduce_combiner_with_side_effect():
+    res = tv.check_equivalence(_RED_COMBINER_SIDE_EFFECT,
+                               _RED_COMBINER_SIDE_EFFECT)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_reshape_reorder_feeding_elementwise():
+    res = tv.check_equivalence(_RED_RESHAPE_REORDER_ELEMENTWISE,
+                               _RED_RESHAPE_REORDER_ELEMENTWISE)
+    assert res.verdict == "UNSUPPORTED", res.verdict

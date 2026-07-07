@@ -93,7 +93,14 @@ fold; only the 2-D store is new.
 - **NOT_EQUIVALENT:** `sum` vs `max`; `sum(x)` vs `sum(x)+1`; N=4 vs a 3-lane
   dropped-term reduce.
 - **UNSUPPORTED:** `axis=1`/rank>1; fused arg-max reduce; masked-reduce;
-  `tt.scan`; `tt.dot`; differing `N` between src and tgt.
+  `tt.scan`; `tt.dot`; a combiner region with extra (e.g. side-effecting) ops;
+  a `tt.reshape allow_reorder` whose result is used by anything other than the
+  reduce.
+
+A *within-function* extent mismatch (a `tt.make_range` whose extent differs from
+the reduced `N`) is rejected. Differing `N` *between* src and tgt is not a
+soundness hole and is **not** rejected: the two functions select different input
+addresses, so the equivalence query is sound and simply returns NOT_EQUIVALENT.
 
 ## Working method
 

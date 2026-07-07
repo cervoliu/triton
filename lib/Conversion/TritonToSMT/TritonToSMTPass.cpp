@@ -496,6 +496,14 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         if (!comb)
           return err(o, "unsupported tt.reduce combiner region (non-canonical "
                         "or fused arg-reduce)");
+        // getSingleCombiner() only checks the *yielded* op; it tolerates extra
+        // ops in the region (e.g. a side-effecting/volatile load) which this
+        // pass would silently drop. Require the region to be exactly
+        // {combiner, reduce.return}.
+        Block &combBlock = o.getCombineOp().front();
+        if (combBlock.getOperations().size() != 2)
+          return err(o, "tt.reduce combiner region must contain only the "
+                        "combining op and the terminator");
         if (!isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
                  arith::MinNumFOp, arith::MinimumFOp>(comb))
           return err(o, "unsupported tt.reduce combiner '" +
@@ -574,15 +582,22 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         // scalar load -> fall through.
       }
       // tt.reshape feeding a reduction. tl.sum/tl.max emit an identity
-      // `tt.reshape allow_reorder` (N -> N) before tt.reduce. The lanes pass
-      // through unchanged: order is irrelevant because the combiner is
-      // associative+commutative over ideal reals (and allow_reorder permits any
-      // order anyway). Non-identity reshapes fall through and are rejected.
+      // `tt.reshape allow_reorder` (N -> N) whose *only* user is the tt.reduce.
+      // The lanes pass through unchanged: order is irrelevant because the
+      // combiner is associative+commutative over ideal reals (and allow_reorder
+      // permits any order anyway). We require the sole user to be a tt.reduce:
+      // `allow_reorder` leaves the element order unspecified, so if the result
+      // fed lane-wise arithmetic the pairing would be nondeterministic and the
+      // identity pass-through could hide a real difference. Any other use (or a
+      // non-identity shape) falls through and is rejected below.
       if (auto o = dyn_cast<triton::ReshapeOp>(op)) {
         EncodedValue in = env[o.getSrc()];
         auto st = dyn_cast<RankedTensorType>(o.getType());
-        if (in.isVector() && st && st.getRank() == 1 && st.hasStaticShape() &&
-            st.getShape()[0] == (int64_t)N) {
+        bool soleReduceUser =
+            o.getResult().hasOneUse() &&
+            isa<triton::ReduceOp>(*o.getResult().getUsers().begin());
+        if (in.isVector() && soleReduceUser && st && st.getRank() == 1 &&
+            st.hasStaticShape() && st.getShape()[0] == (int64_t)N) {
           env[o.getResult()] = in;
           continue;
         }
