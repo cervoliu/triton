@@ -26,3 +26,13 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
 
 The Codex review loop lives in `scripts/`: `scripts/smt-review.sh` (runs the
 external reviewer) and `scripts/smt-review-prompt.md` (its prompt).
+
+## Verification & patch tooling
+
+- `scripts/smt-verify.sh` — one-command verification: builds triton-opt,
+  probes the environment (pass registered, mlir-translate patched, z3
+  present), then runs the lit tests and pytest suite, failing loudly on skips.
+- `scripts/regenerate-smt-patch.sh` — regenerates
+  `scripts/patches/mlir-smt-real.patch` from an LLVM checkout and verifies it
+  applies cleanly to the pinned revision. Run after any edit to the SMT
+  dialect files in `.llvm-project/src`.
