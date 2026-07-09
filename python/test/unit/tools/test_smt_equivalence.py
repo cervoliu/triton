@@ -1344,3 +1344,50 @@ def test_split_funcs_error_is_recorded_not_dropped():
     # break that hides subsequent functions.
     r = _split_structured("module {\n  tt.func public @bad() { %c =\n}\n")
     assert r.errors, r
+
+
+# Codex milestone-4 review round 2: type-level inline attribute dicts in bare
+# result types, and zero-work sweeps must not exit green.
+def test_split_funcs_inline_type_attribute_result():
+    from triton.tools.smt_validate_passes import _split_structured
+    ttir = """module {
+  tt.func private @f(%a: tensor<4xi32>) -> tensor<4xi32, #ttg.slice<{dim = 0, parent = #b}>> {
+    %r = "some.op"(%a) : (tensor<4xi32>) -> tensor<4xi32, #ttg.slice<{dim = 0, parent = #b}>>
+    tt.return %r : tensor<4xi32, #ttg.slice<{dim = 0, parent = #b}>>
+  }
+  tt.func public @g() {
+    tt.return
+  }
+}
+"""
+    r = _split_structured(ttir)
+    assert len(r.defs) == 2 and not r.errors, (len(r.defs), r.errors)
+    assert "tt.return %r" in r.defs[0], r.defs[0]
+    assert r.defs[1].startswith("tt.func public @g")
+
+
+def test_split_funcs_corpus_inline_type_attrs():
+    from pathlib import Path
+    from triton.tools import smt_validate_passes as vp
+    root = Path(__file__).resolve().parents[4] / "test" / "Conversion"
+    for name in ("reduce_to_llvm.mlir", "cvt_to_llvm.mlir"):
+        parsed = vp._parse_file(root / name, tv.default_triton_opt())
+        assert parsed is not None, name
+        r = vp._split_structured(parsed)
+        assert not r.errors, (name, r.errors)
+        assert all(d.rstrip().endswith("}") and "tt.return" in d
+                   for d in r.defs), name
+
+
+def test_sweep_zero_work_fails():
+    from triton.tools import smt_validate_passes as vp
+    assert vp._main(["--corpus", "/nonexistent/smt-corpus",
+                     "--passes", "canonicalize"]) != 0
+    assert vp._main(["--corpus", "test", "--passes", ""]) != 0
+
+
+def test_sweep_unknown_pass_is_fatal():
+    from triton.tools import smt_validate_passes as vp
+    with pytest.raises(RuntimeError, match="does not recognize"):
+        vp.validate_pass("tt.func public @k() { tt.return }",
+                         "no-such-pass-xyz", tv.default_triton_opt(), 30.0)

@@ -175,15 +175,19 @@ Sweep results (2026-07-09, 4 passes; non-recursive over each directory):
 | `test/Triton` | 13 (5) | 70 | 280 | 0 | 276 | 4 | 0 |
 | `test/Conversion` | 36 (14) | 79 | 316 | 40 | 108 | 168 | 0 |
 
-Zero NOT_EQUIVALENT among the 596 attempted pairs; 40 decided EQUIVALENT;
-the remaining categories are *inconclusive coverage*, not validation.
-`test/Triton` is dominated by out-of-contract constructs (`scf.for`,
-non-void lit-snippet functions, `tt.dot`, tensor descriptors), matching
-mlir-tv's partial-coverage experience. Per-function results confirm every
-definition in `test/Conversion/triton_to_smt*.mlir` is EQUIVALENT under
-all four passes (8+16+8+8 = 40/40). No pass bug surfaced. Growing the
-EQUIVALENT column is the phase-3 coverage agenda (loops, `tt.dot`,
-stride-general addressing).
+No semantic counterexample surfaced among the 40 decided pairs; zero
+NOT_EQUIVALENT among the 596 attempts overall. The remaining categories are
+*inconclusive coverage*, not validation: `test/Triton` is dominated by
+out-of-contract constructs (`scf.for`, non-void lit-snippet functions,
+`tt.dot`, tensor descriptors), matching mlir-tv's partial-coverage
+experience, and PASS_ERROR includes functions that cannot reparse standalone
+because they reference module-level layout aliases dropped by extraction.
+Per-function results confirm every definition in
+`test/Conversion/triton_to_smt*.mlir` is EQUIVALENT under all four passes
+(8+16+8+8 = 40/40). A zero-work sweep (missing/empty corpus, empty or
+unrecognized pass, zero attempts, or a pass failing on every definition)
+exits nonzero. Growing the EQUIVALENT column is the phase-3 coverage agenda
+(loops, `tt.dot`, stride-general addressing).
 
 ## Working method
 
