@@ -5,7 +5,9 @@ Triton kernels: the `--convert-triton-to-smt` pass
 (`lib/Conversion/TritonToSMT/`), the driver
 (`python/triton/tools/smt_equivalence.py`), and a `Real` sort added to MLIR's
 `smt` dialect via `scripts/patches/mlir-smt-real.patch`. Docs index:
-`docs/smt-tv/README.md`.
+`docs/smt-tv/README.md`. The pass always emits three solver scopes in fixed
+order (0 addressing, 1 UB-domain equality, 2 equivalence); the driver decodes
+them positionally — change both together.
 
 ## Environment
 
@@ -31,10 +33,16 @@ without tools, and skipped soundness tests look identical to passing ones.
 
 - lit only: `.llvm-project/build/bin/llvm-lit -sv build/cmake.*/test/Conversion --filter triton_to_smt`
 - pytest only: `cd python && ../.venv/bin/python -m pytest test/unit/tools/test_smt_equivalence.py`
+- pass-validation sweep: `PYTHONPATH=python .venv/bin/python -m triton.tools.smt_validate_passes --corpus test/Triton`
+  (pass names must be atomic, e.g. `canonicalize`; pipeline grammar is rejected by design).
 
 Adversarial soundness reviews go to the external Codex reviewer via the Codex
 plugin (`/codex:rescue`), using the brief in `docs/smt-tv/review-prompt.md` —
-there is no shell wrapper for this.
+there is no shell wrapper for this. The reviewer's sandbox denies exec and
+file writes: it reviews statically, names reproducers (run them yourself
+before fixing), and emits the review markdown for you to transcribe into
+`docs/smt-tv/<phase>-review.md`. `AGENTS.md` defers to this file so Codex
+loads the same context.
 
 ## Rules
 
@@ -46,6 +54,12 @@ there is no shell wrapper for this.
   IEEE-754), integers are fixed-width bit-vectors, pointer args are assumed
   disjoint, byte-backed `i1` buffers use nonzero=true. See
   `docs/smt-tv/phase-1.md` ("Modeling assumptions") before "fixing" them.
+- Equivalence is bidirectional refinement (phase 2): kernels that are UB on
+  exactly the same inputs are EQUIVALENT by design — two identical unbounded
+  shifts is not a false positive. Poison is tracked EXACTLY per value
+  (over-approximating breaks UB-domain equality; `select` uses
+  `p(c) ∨ ite(c, p(t), p(f))`), and UB means poison reaching a memory op.
+  See `docs/smt-tv/phase-2.md` milestone 3.
 - Elementwise op semantics live in ONE place: `encodeElementwise` in
   `TritonToSMTPass.cpp`. Do not reintroduce per-context copies.
 - Never edit `.llvm-project/src` SMT files without regenerating the patch:
