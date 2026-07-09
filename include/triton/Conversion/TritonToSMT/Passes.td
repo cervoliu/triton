@@ -17,12 +17,14 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
 
     * scope 0 (addressing): asserts a store offset can differ from `i`;
       `unsat` proves identity addressing.
-    * scope 1 (well-definedness): asserts the negation of the conjunction of
-      all per-op well-definedness conditions (e.g. shift amount < width);
-      `unsat` proves no input reaches a poison case, so the total SMT
-      encodings are faithful. Trivially `unsat` when no such ops occur.
-    * scope 2 (equivalence): asserts the two functions' final output arrays
-      can differ; `unsat` means the functions are equivalent.
+    * scope 1 (UB-domain equality): asserts the two functions' UB predicates
+      differ on some input; `unsat` proves both are UB on exactly the same
+      inputs. Poison (e.g. an oversized shift amount) is tracked exactly per
+      value and counts as UB only when it reaches a memory operation.
+      Trivially `unsat` when neither function can be UB.
+    * scope 2 (equivalence): asserts the final output arrays can differ on an
+      input where neither function is UB; `unsat` means the functions are
+      equivalent in the sense of bidirectional refinement.
 
     Exporting the result to SMT-LIB (`mlir-translate --export-smtlib`) and
     running an SMT solver yields one sat/unsat/unknown line per scope.

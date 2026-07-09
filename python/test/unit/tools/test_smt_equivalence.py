@@ -927,8 +927,8 @@ def test_shl_vs_mul_equivalent():
     tgt = _i32_kernel("""%c4 = arith.constant 4 : i32
     %r = arith.muli %x, %c4 : i32""", "%r")
     res = tv.check_equivalence(src, tgt)
-    assert res.equivalent, (res.verdict, res.wd_status, res.equivalence_status)
-    assert res.wd_status == "unsat", res.wd_status
+    assert res.equivalent, (res.verdict, res.ub_status, res.equivalence_status)
+    assert res.ub_status == "unsat", res.ub_status
 
 
 def test_shl_vs_mul3_not_equivalent():
@@ -953,25 +953,82 @@ def test_shift_by_31_boundary_equivalent():
     k = _i32_kernel("""%c31 = arith.constant 31 : i32
     %r = arith.shrui %x, %c31 : i32""", "%r")
     res = tv.check_equivalence(k, k)
-    assert res.equivalent, (res.verdict, res.wd_status)
+    assert res.equivalent, (res.verdict, res.ub_status)
 
 
-def test_reject_shift_by_width():
-    # amt == width is poison; wd scope must be sat -> UNSUPPORTED, and two
-    # syntactically identical kernels must NOT be reported EQUIVALENT.
+def test_same_ub_domain_shift_by_width_equivalent():
+    # amt == width is poison on ALL inputs -- for both kernels identically.
+    # Bidirectional refinement: identical UB domains + (vacuously) equal
+    # outputs off-domain => EQUIVALENT.
     k = _i32_kernel("""%c32 = arith.constant 32 : i32
     %r = arith.shli %x, %c32 : i32""", "%r")
     res = tv.check_equivalence(k, k)
-    assert res.verdict == "UNSUPPORTED", (res.verdict, res.wd_status)
-    assert res.wd_status == "sat", res.wd_status
+    assert res.equivalent, (res.verdict, res.ub_status)
+    assert res.ub_status == "unsat", res.ub_status
 
 
-def test_reject_unbounded_shift_amount():
-    # The shift amount is a loaded value; nothing bounds it below the width.
+def test_same_unbounded_shift_equivalent():
+    # The shift amount is unbounded, so both kernels are UB on the same
+    # inputs (x >= 32) and equal elsewhere => EQUIVALENT.
     k = _i32_kernel("""%r = arith.shli %x, %x : i32""", "%r")
     res = tv.check_equivalence(k, k)
-    assert res.verdict == "UNSUPPORTED", (res.verdict, res.wd_status)
-    assert res.wd_status == "sat", res.wd_status
+    assert res.equivalent, (res.verdict, res.ub_status)
+    assert res.ub_status == "unsat", res.ub_status
+
+
+def test_asymmetric_ub_not_equivalent():
+    # src stores an oversized-shift result (UB for x >= 32); tgt stores a
+    # defined value everywhere. Their UB domains differ => NOT_EQUIVALENT.
+    src = _i32_kernel("""%r = arith.shli %x, %x : i32""", "%r")
+    tgt = _i32_kernel("""%c0b = arith.constant 0 : i32
+    %r = arith.addi %x, %c0b : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.ub_status)
+    assert res.ub_status == "sat", res.ub_status
+
+
+def test_dead_poison_is_not_ub():
+    # src computes an unbounded shift but never stores it; poison that does
+    # not reach memory is not UB, so src == tgt (both store x).
+    src = _i32_kernel("""%dead = arith.shli %x, %x : i32
+    %c0b = arith.constant 0 : i32
+    %r = arith.addi %x, %c0b : i32""", "%r")
+    tgt = _i32_kernel("""%r = arith.addi %x, %x : i32
+    %r2 = arith.subi %r, %x : i32""", "%r2")
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.ub_status)
+    assert res.ub_status == "unsat", res.ub_status
+
+
+def test_dead_vs_stored_poison_not_equivalent():
+    # Same dead shift on the src side, but tgt STORES the poison; exact
+    # poison tracking must distinguish these (a coarse global conjunction
+    # would report them equivalent).
+    src = _i32_kernel("""%dead = arith.shli %x, %x : i32
+    %c0b = arith.constant 0 : i32
+    %r = arith.addi %x, %c0b : i32""", "%r")
+    tgt = _i32_kernel("""%r = arith.shli %x, %x : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.ub_status)
+    assert res.ub_status == "sat", res.ub_status
+
+
+def test_mask_gates_poison_store_equivalent():
+    # The store mask excludes exactly the poisoned inputs, so neither kernel
+    # is ever UB, and under the mask amt < 32 makes amt == (amt & 31).
+    src = _i32_kernel("""%c32b = arith.constant 32 : i32
+    %pm = arith.cmpi ult, %x, %c32b : i32
+    %sh = arith.shli %x, %x : i32
+    %r = arith.select %pm, %sh, %x : i32""", "%r")
+    tgt = _i32_kernel("""%c32b = arith.constant 32 : i32
+    %c31b = arith.constant 31 : i32
+    %pm = arith.cmpi ult, %x, %c32b : i32
+    %amt = arith.andi %x, %c31b : i32
+    %sh = arith.shli %x, %amt : i32
+    %r = arith.select %pm, %sh, %x : i32""", "%r")
+    res = tv.check_equivalence(src, tgt)
+    assert res.equivalent, (res.verdict, res.ub_status)
+    assert res.ub_status == "unsat", res.ub_status
 
 
 def test_masked_shift_amount_equivalent():
@@ -981,8 +1038,8 @@ def test_masked_shift_amount_equivalent():
     %amt = arith.andi %x, %c31 : i32
     %r = arith.shrui %x, %amt : i32""", "%r")
     res = tv.check_equivalence(k, k)
-    assert res.equivalent, (res.verdict, res.wd_status)
-    assert res.wd_status == "unsat", res.wd_status
+    assert res.equivalent, (res.verdict, res.ub_status)
+    assert res.ub_status == "unsat", res.ub_status
 
 
 def test_reject_shl_overflow_flags():
@@ -1084,9 +1141,9 @@ _RED_MUL_ADDR = _RED_SHL_ADDR.replace(
 
 def test_reduce_with_shifted_addressing_equivalent():
     res = tv.check_equivalence(_RED_SHL_ADDR, _RED_MUL_ADDR)
-    assert res.equivalent, (res.verdict, res.wd_status,
+    assert res.equivalent, (res.verdict, res.ub_status,
                             res.equivalence_status)
-    assert res.wd_status == "unsat", res.wd_status
+    assert res.ub_status == "unsat", res.ub_status
 
 
 # --- Codex review round 1 (phase-2 milestone 2) regression tests. ---

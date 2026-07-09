@@ -1,29 +1,31 @@
 // RUN: triton-opt %s --convert-triton-to-smt | FileCheck %s
 // RUN: triton-opt %s --convert-triton-to-smt | mlir-translate --export-smtlib | FileCheck %s --check-prefix=SMTLIB
 
-// Shifts encode as total SMT bv ops plus a well-definedness condition
-// (amt < width) collected into the dedicated scope 1. Three scopes total:
-// 0 = addressing, 1 = well-definedness, 2 = equivalence.
+// Shifts encode as total SMT bv ops; each shift contributes an exact poison
+// condition (amt >=u width) that becomes UB when it reaches a memory
+// operation. Three scopes: 0 = addressing, 1 = UB-domain equality
+// (assert UB_src != UB_tgt), 2 = equivalence gated on neither side being UB.
 
 // Scope 0 (addressing):
 // CHECK: smt.solver
 // CHECK: smt.distinct %{{.*}}, %i : !smt.bv<32>
-// Scope 1 (well-definedness): amt < 32 for each shift of each function,
-// negated conjunction asserted.
+// Scope 1 (UB-domain equality): poison conditions amt >= 32, UB predicates
+// compared for disequality.
 // CHECK: smt.solver
-// CHECK: smt.bv.cmp ult %{{.*}}, %{{.*}} : !smt.bv<32>
-// CHECK: smt.and
-// CHECK: smt.not
+// CHECK: smt.bv.cmp uge %{{.*}}, %{{.*}} : !smt.bv<32>
+// CHECK: smt.distinct %{{.*}}, %{{.*}} : !smt.bool
 // CHECK: smt.assert
 // Scope 2 (equivalence):
 // CHECK: smt.solver
 // CHECK-DAG: smt.bv.shl
 // CHECK-DAG: smt.bv.lshr
 // CHECK: smt.distinct %{{.*}}, %{{.*}} : !smt.bv<32>
+// CHECK: smt.not
+// CHECK: smt.assert
 
 // SMTLIB: ; solver scope 0
 // SMTLIB: ; solver scope 1
-// SMTLIB: bvult
+// SMTLIB: bvuge
 // SMTLIB: ; solver scope 2
 // SMTLIB-DAG: bvshl
 // SMTLIB-DAG: bvlshr

@@ -19,10 +19,12 @@
 //   * 32-bit indexing, `program_id` axis 0, matching full signatures.
 //
 // It emits three solver scopes, in fixed order: scope 0 checks that addressing
-// is identity (unsat => identity holds); scope 1 checks well-definedness
-// (unsat => no input reaches a poison case, e.g. an oversized shift, so the
-// total SMT encodings are faithful); scope 2 asserts the two functions' output
-// arrays can differ (unsat => equivalent). See Passes.td.
+// is identity (unsat => identity holds); scope 1 checks that the two
+// functions' UB domains coincide (unsat => both are UB on exactly the same
+// inputs; poison, e.g. an oversized shift, is tracked exactly per value and
+// only becomes UB when it reaches a memory operation); scope 2 asserts the
+// output arrays can differ on an input where neither function is UB (unsat =>
+// equivalent as bidirectional refinement). See Passes.td.
 //
 //===----------------------------------------------------------------------===//
 
@@ -139,28 +141,56 @@ struct EncodedValue {
   Value array;  // pointer: the memory array symbol
   Value offset; // scalar pointer: the bit-vector element offset
   bool fresh = false; // pointer: true iff no tt.addptr has been applied yet
+  // Poison predicate (smt Bool): true on inputs where this value is poison.
+  // Null means provably never poison. Propagated EXACTLY (not merely
+  // over-approximated): the bidirectional-refinement query compares the two
+  // functions' UB domains for equality, and an over-approximation could hide
+  // a domain difference (e.g. dead poison on one side only) behind equal
+  // formulas, yielding a false EQUIVALENT.
+  Value poison;
   // Reduction mode: a tensor materialized as N per-lane terms. For a vector
   // *value* these are the lane SMT values (array == null); for a vector
   // *pointer* they are the per-lane bit-vector offsets (array != null).
   SmallVector<Value> lanes;
+  // Per-lane poison predicates; parallel to `lanes` when non-empty. An empty
+  // vector with non-empty `lanes` means no lane is ever poison.
+  SmallVector<Value> lanePoison;
   bool isPtr() const { return array != nullptr; }
   bool isVector() const { return !lanes.empty(); }
   // Value at lane k, broadcasting a scalar operand.
   Value laneVal(unsigned k) const { return isVector() ? lanes[k] : value; }
   Value laneOff(unsigned k) const { return isVector() ? lanes[k] : offset; }
-  static EncodedValue plain(Value v) { return {v, nullptr, nullptr, false, {}}; }
-  static EncodedValue ptr(Value a, Value o, bool fresh = false) {
-    return {nullptr, a, o, fresh, {}};
+  // Poison at lane k, broadcasting a scalar operand's poison.
+  Value lanePsn(unsigned k) const {
+    if (!isVector())
+      return poison;
+    return lanePoison.empty() ? Value() : lanePoison[k];
   }
-  static EncodedValue vec(SmallVector<Value> ls) {
+  static EncodedValue plain(Value v, Value p = nullptr) {
     EncodedValue e;
-    e.lanes = std::move(ls);
+    e.value = v;
+    e.poison = p;
     return e;
   }
-  static EncodedValue vecPtr(Value a, SmallVector<Value> offs) {
+  static EncodedValue ptr(Value a, Value o, bool fresh = false) {
+    EncodedValue e;
+    e.array = a;
+    e.offset = o;
+    e.fresh = fresh;
+    return e;
+  }
+  static EncodedValue vec(SmallVector<Value> ls, SmallVector<Value> ps = {}) {
+    EncodedValue e;
+    e.lanes = std::move(ls);
+    e.lanePoison = std::move(ps);
+    return e;
+  }
+  static EncodedValue vecPtr(Value a, SmallVector<Value> offs,
+                             SmallVector<Value> ps = {}) {
     EncodedValue e;
     e.array = a;
     e.lanes = std::move(offs);
+    e.lanePoison = std::move(ps);
     return e;
   }
 };
@@ -189,14 +219,14 @@ struct ConvertTritonToSMT
                      Value &outIndex, SmallVectorImpl<EncodedValue> &outArgs);
 
   // Encode `func` at the symbolic index `iVal` using `sharedArgs`. Appends the
-  // function's stores to `stores` and its per-op well-definedness conditions
-  // (Bool terms that must hold for the encoding to be faithful, e.g. shift
-  // amount < width) to `wdConds`. Returns false (and emits an error) if the
-  // function uses an unsupported construct.
+  // function's stores to `stores` and sets `outUB` to the function's UB
+  // predicate: a Bool that is true exactly on inputs where poison (tracked
+  // per value, e.g. from an oversized shift) reaches a memory operation.
+  // Null means the function is UB-free on all inputs. Returns false (and
+  // emits an error) if the function uses an unsupported construct.
   bool encodeFunction(OpBuilder &b, triton::FuncOp func,
                       ArrayRef<EncodedValue> sharedArgs, Value iVal,
-                      SmallVectorImpl<StoreInfo> &stores,
-                      SmallVectorImpl<Value> &wdConds);
+                      SmallVectorImpl<StoreInfo> &stores, Value &outUB);
 };
 
 bool ConvertTritonToSMT::declareInputs(OpBuilder &b, Location loc,
@@ -241,7 +271,7 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                                         ArrayRef<EncodedValue> sharedArgs,
                                         Value iVal,
                                         SmallVectorImpl<StoreInfo> &stores,
-                                        SmallVectorImpl<Value> &wdConds) {
+                                        Value &outUB) {
   MLIRContext *ctx = &getContext();
   Location loc = func.getLoc();
   auto R = smt::RealType::get(ctx);
@@ -299,6 +329,24 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
       return rt.getElementType();
     return t;
   };
+
+  // Poison algebra over optional Bool predicates (null == provably-false).
+  // Propagation must stay EXACT (see EncodedValue::poison): every rule below
+  // matches the arith/LLVM poison semantics of the op it encodes.
+  auto orPoison = [&](Value a, Value c) -> Value {
+    if (!a)
+      return c;
+    if (!c)
+      return a;
+    return smt::OrOp::create(b, loc, a, c).getResult();
+  };
+  auto andCond = [&](Value cond, Value p) -> Value { // cond ∧ p, null-aware p
+    if (!p)
+      return nullptr;
+    return band(cond, p);
+  };
+  // UB conditions accumulated as poison reaches memory operations.
+  SmallVector<Value> ubConds;
 
   // Reject external declarations (empty body) and multi-block functions before
   // touching the entry block.
@@ -417,13 +465,20 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
 
   // The single source of truth for pure elementwise op semantics, shared by
   // the scalar path, the per-lane (reduction) path, and the reduce combiner.
-  // Operands are fetched through `A`, which reads the plain value in scalar
-  // context and the lane value (broadcasting scalars) in vector context.
-  // Returns the encoded value; a null result with a non-empty `why` is a
-  // rejection (unsupported flag/operand sort), and a null result with an empty
-  // `why` means `op` is not a pure elementwise op at all.
+  // Operands are fetched through `A` (value) and `P` (poison predicate),
+  // which read the plain value in scalar context and the lane value
+  // (broadcasting scalars) in vector context. On success sets `outPoison` to
+  // the result's exact poison predicate (null == never). A null result with a
+  // non-empty `why` is a rejection (unsupported flag/operand sort); a null
+  // result with an empty `why` means `op` is not a pure elementwise op.
   auto encodeElementwise = [&](Operation *op, llvm::function_ref<Value(Value)> A,
-                               std::string &why) -> Value {
+                               llvm::function_ref<Value(Value)> P,
+                               Value &outPoison, std::string &why) -> Value {
+    // Default: any-operand-poison, which is the exact arith rule for every
+    // op below except select (overridden in its case).
+    outPoison = nullptr;
+    for (Value operand : op->getOperands())
+      outPoison = orPoison(outPoison, P(operand));
     return llvm::TypeSwitch<Operation *, Value>(op)
         .Case<arith::AddFOp>([&](arith::AddFOp o) {
           return realBin(A(o.getLhs()), A(o.getRhs()), /*mul=*/false);
@@ -521,13 +576,11 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
             return smt::XOrOp::create(b, loc, x, y).getResult();
           return smt::BVXOrOp::create(b, loc, x, y).getResult();
         })
-        // Shifts. An oversized shift amount (>= width) is poison in arith but
-        // defined for the total SMT bv shifts, so each shift contributes a
-        // well-definedness condition `amt < width` (mlir-tv's wellDefined(op,
-        // cond) idea). A dedicated solver scope proves the conjunction holds
-        // for ALL inputs; if it cannot, the driver reports UNSUPPORTED -- the
-        // total encoding is only trusted when no input can reach the poison
-        // case.
+        // Shifts. An oversized shift amount (>= width) yields poison in arith
+        // but a defined value for the total SMT bv shifts, so the result's
+        // poison predicate gains `amt >=u width` (mlir-tv's wellDefined(op,
+        // cond) idea, tracked per value). Poison only becomes UB -- and only
+        // then affects the verdict -- when it reaches a memory operation.
         .Case<arith::ShLIOp, arith::ShRUIOp, arith::ShRSIOp>(
             [&](auto o) -> Value {
               if constexpr (std::is_same_v<decltype(o), arith::ShLIOp>) {
@@ -547,8 +600,9 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                 return Value();
               }
               unsigned w = cast<smt::BitVectorType>(x.getType()).getWidth();
-              wdConds.push_back(
-                  bvcmp(smt::BVCmpPredicate::ult, y, bvc(APInt(w, w))));
+              outPoison = orPoison(
+                  outPoison,
+                  bvcmp(smt::BVCmpPredicate::uge, y, bvc(APInt(w, w))));
               if (isa<arith::ShLIOp>(o.getOperation()))
                 return smt::BVShlOp::create(b, loc, x, y).getResult();
               if (isa<arith::ShRUIOp>(o.getOperation()))
@@ -652,6 +706,22 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
             why = "pointer-valued select is not supported";
             return Value();
           }
+          // Exact poison rule: select is NOT poison-strict in its unchosen
+          // arm -- p(cond) ∨ ite(cond, p(t), p(f)). The default any-operand
+          // rule would over-approximate, which the refinement query forbids.
+          Value pc = P(o.getCondition());
+          Value pt = P(o.getTrueValue()), pf = P(o.getFalseValue());
+          Value chosen = nullptr;
+          if (pt || pf) {
+            auto orFalse = [&](Value p) -> Value {
+              return p ? p
+                       : smt::BoolConstantOp::create(b, loc, Bool,
+                                                     b.getBoolAttr(false))
+                             .getResult();
+            };
+            chosen = ite(A(o.getCondition()), orFalse(pt), orFalse(pf));
+          }
+          outPoison = orPoison(pc, chosen);
           return ite(A(o.getCondition()), A(o.getTrueValue()),
                      A(o.getFalseValue()));
         })
@@ -660,13 +730,17 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
 
   // Reduction (vector) mode: encode one elementwise op at lane `k`,
   // broadcasting scalar operands, under exactly the scalar rules.
-  auto encodeVectorLane = [&](Operation *op, unsigned k,
+  auto encodeVectorLane = [&](Operation *op, unsigned k, Value &outPoison,
                               std::string &why) -> Value {
     auto A = [&](Value v) -> Value {
       auto it = env.find(v);
       return it == env.end() ? Value() : it->second.laneVal(k);
     };
-    return encodeElementwise(op, A, why);
+    auto P = [&](Value v) -> Value {
+      auto it = env.find(v);
+      return it == env.end() ? Value() : it->second.lanePsn(k);
+    };
+    return encodeElementwise(op, A, P, outPoison, why);
   };
 
   for (Operation &opRef : entry) {
@@ -754,8 +828,10 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               return x;
             return Value();
           };
+          auto Pnone = [](Value) -> Value { return Value(); };
           std::string why;
-          return encodeElementwise(comb, A, why);
+          Value ignored;
+          return encodeElementwise(comb, A, Pnone, ignored, why);
         };
         Value acc = in.lanes[0];
         for (unsigned k = 1; k < N; ++k) {
@@ -763,7 +839,12 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           if (!acc)
             return err(o, "failed to encode tt.reduce combiner");
         }
-        env[o->getResult(0)] = EncodedValue::plain(acc);
+        // The whitelisted combiners are poison-strict, so the fold's poison
+        // is exactly the disjunction of the lane poisons.
+        Value foldPoison;
+        for (unsigned k = 0; k < N; ++k)
+          foldPoison = orPoison(foldPoison, in.lanePsn(k));
+        env[o->getResult(0)] = EncodedValue::plain(acc, foldPoison);
         continue;
       }
       // addptr with a per-lane offset (or vector base) -> vector pointer.
@@ -779,13 +860,21 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           if (!base.isPtr() || !base.fresh)
             return err(o, "vector tt.addptr requires a fresh base pointer "
                           "(chained addptr is not supported)");
-          SmallVector<Value> offs;
+          SmallVector<Value> offs, offPs(N);
           offs.reserve(N);
-          for (unsigned k = 0; k < N; ++k)
+          bool anyPsn = false;
+          for (unsigned k = 0; k < N; ++k) {
             offs.push_back(smt::BVAddOp::create(b, loc, base.laneOff(k),
                                                 off.laneVal(k))
                                .getResult());
-          env[o.getResult()] = EncodedValue::vecPtr(base.array, std::move(offs));
+            offPs[k] = off.lanePsn(k); // base is a fresh arg: never poison
+            anyPsn |= offPs[k] != nullptr;
+          }
+          if (!anyPsn)
+            offPs.clear();
+          env[o.getResult()] =
+              EncodedValue::vecPtr(base.array, std::move(offs),
+                                   std::move(offPs));
           continue;
         }
         // scalar addptr -> fall through to the existing case.
@@ -808,8 +897,13 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                           "pointer bitcast; not supported");
           SmallVector<Value> ls;
           ls.reserve(N);
-          for (unsigned k = 0; k < N; ++k)
+          for (unsigned k = 0; k < N; ++k) {
             ls.push_back(sel(p.array, p.lanes[k], range));
+            // Loading through a poisoned address is UB (this unmasked load
+            // always executes). Loaded values themselves are never poison.
+            if (Value psn = p.lanePsn(k))
+              ubConds.push_back(psn);
+          }
           env[o.getResult()] = EncodedValue::vec(std::move(ls));
           continue;
         }
@@ -847,10 +941,12 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         }
       }
       if (anyVec) {
-        SmallVector<Value> ls(N);
+        SmallVector<Value> ls(N), ps(N);
+        bool anyPoison = false;
         for (unsigned k = 0; k < N; ++k) {
           std::string why;
-          Value r = encodeVectorLane(op, k, why);
+          Value p;
+          Value r = encodeVectorLane(op, k, p, why);
           if (!r)
             return err(op, why.empty()
                                ? ("operation '" + op->getName().getStringRef() +
@@ -859,8 +955,12 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                                      .str()
                                : why);
           ls[k] = r;
+          ps[k] = p;
+          anyPoison |= p != nullptr;
         }
-        env[op->getResult(0)] = EncodedValue::vec(std::move(ls));
+        if (!anyPoison)
+          ps.clear();
+        env[op->getResult(0)] = EncodedValue::vec(std::move(ls), std::move(ps));
         continue;
       }
     }
@@ -870,9 +970,14 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
     // elementwise" miss falls through to the structural cases below.
     {
       std::string why;
-      Value r = encodeElementwise(op, V, why);
+      Value p;
+      auto Psc = [&](Value v) -> Value {
+        auto it = env.find(v);
+        return it == env.end() ? Value() : it->second.poison;
+      };
+      Value r = encodeElementwise(op, V, Psc, p, why);
       if (r) {
-        env[op->getResult(0)] = EncodedValue::plain(r);
+        env[op->getResult(0)] = EncodedValue::plain(r, p);
         continue;
       }
       if (!why.empty())
@@ -985,11 +1090,15 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                 return err(o, "chained tt.addptr is not supported (32-bit offset "
                               "accumulation can differ from 64-bit pointer "
                               "arithmetic)");
-              env[o.getResult()] = EncodedValue::ptr(
+              EncodedValue r = EncodedValue::ptr(
                   base.array,
                   smt::BVAddOp::create(b, loc, base.offset, V(o.getOffset()))
                       .getResult(),
                   /*fresh=*/false);
+              // A pointer built from a poisoned offset is itself poison; it
+              // becomes UB at the load/store that dereferences it.
+              r.poison = env[o.getOffset()].poison; // fresh base: never poison
+              env[o.getResult()] = r;
               return true;
             })
             .Case<triton::LoadOp>([&](triton::LoadOp o) {
@@ -1011,16 +1120,35 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                 return err(o, "load reinterprets the buffer's element sort via a "
                               "pointer bitcast; not supported");
               Value loaded = sel(p.array, p.offset, range);
+              Value resultPoison;
               // A masked load without `other` leaves masked-out lanes undefined
               // in Triton; ignoring the mask would be unsound, so require the
               // fallback and model it explicitly.
+              //
+              // UB accounting (exact): a poison mask is UB; a poison address
+              // is UB only when the access executes (mask true). Loaded
+              // memory values are never poison; a masked-out lane takes
+              // `other`'s poison.
               if (o.getMask()) {
                 if (!o.getOther())
                   return err(o, "masked load without a fallback `other` is "
                                 "undefined and not supported");
-                loaded = ite(V(o.getMask()), loaded, V(o.getOther()));
+                Value mask = V(o.getMask());
+                if (Value pm = env[o.getMask()].poison)
+                  ubConds.push_back(pm);
+                if (Value pa = andCond(mask, p.poison))
+                  ubConds.push_back(pa);
+                loaded = ite(mask, loaded, V(o.getOther()));
+                if (Value po = env[o.getOther()].poison) {
+                  Value pfalse = smt::BoolConstantOp::create(
+                                     b, loc, Bool, b.getBoolAttr(false))
+                                     .getResult();
+                  resultPoison = ite(mask, pfalse, po);
+                }
+              } else if (p.poison) {
+                ubConds.push_back(p.poison);
               }
-              env[o.getResult()] = EncodedValue::plain(loaded);
+              env[o.getResult()] = EncodedValue::plain(loaded, resultPoison);
               return true;
             })
             .Case<triton::StoreOp>([&](triton::StoreOp o) {
@@ -1034,6 +1162,21 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               if (!v)
                 return err(o, "stored value sort is incompatible with the "
                               "buffer sort");
+              // UB accounting (exact): a poison mask is UB; a poison address
+              // or poison stored value is UB only when the store executes
+              // (mask true). Masked-out poison is NOT UB -- that asymmetry is
+              // why poison must be tracked per value rather than as a global
+              // well-definedness conjunction.
+              Value valPoison = env[o.getValue()].poison;
+              Value execPoison = orPoison(p.poison, valPoison);
+              if (o.getMask()) {
+                if (Value pm = env[o.getMask()].poison)
+                  ubConds.push_back(pm);
+                if (Value pe = andCond(V(o.getMask()), execPoison))
+                  ubConds.push_back(pe);
+              } else if (execPoison) {
+                ubConds.push_back(execPoison);
+              }
               stores.push_back(
                   {p.array, p.offset, v, o.getMask() ? V(o.getMask()) : Value()});
               return true;
@@ -1049,6 +1192,9 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
   if (stores.size() != 1)
     return err(func, "exactly one store is required (found " +
                          Twine(stores.size()) + ")");
+  outUB = nullptr;
+  for (Value c : ubConds)
+    outUB = orPoison(outUB, c);
   return true;
 }
 
@@ -1105,9 +1251,17 @@ void ConvertTritonToSMT::runOnOperation() {
   OpBuilder builder(ctx);
 
   // Build one solver scope, returning the terminating check op's builder state.
-  // `mode`: 0 = addressing-identity check, 1 = well-definedness check,
+  // `mode`: 0 = addressing-identity check, 1 = UB-domain-equality check,
   // 2 = equivalence check. All three scopes are always emitted, in this order,
   // so the driver's scope-position contract stays fixed.
+  //
+  // Equivalence is bidirectional refinement: the two functions must be UB on
+  // exactly the same inputs (scope 1: assert UB_src != UB_tgt; unsat =>
+  // domains coincide) and produce equal outputs on every input where neither
+  // is UB (scope 2). A function's UB predicate is exact -- poison that never
+  // reaches a memory operation does not count -- so two kernels that are UB
+  // in the same way are EQUIVALENT, and a kernel that is UB where the other
+  // is defined is NOT_EQUIVALENT.
   auto buildScope = [&](int mode) -> bool {
     builder.setInsertionPointToEnd(module.getBody());
     auto solver = smt::SolverOp::create(builder, loc, TypeRange{}, ValueRange{});
@@ -1121,11 +1275,20 @@ void ConvertTritonToSMT::runOnOperation() {
       return false;
 
     SmallVector<StoreInfo> storesS, storesT;
-    SmallVector<Value> wdConds;
-    if (!encodeFunction(builder, src, shared, iVal, storesS, wdConds) ||
-        !encodeFunction(builder, tgt, shared, iVal, storesT, wdConds))
+    Value ubS = nullptr, ubT = nullptr;
+    if (!encodeFunction(builder, src, shared, iVal, storesS, ubS) ||
+        !encodeFunction(builder, tgt, shared, iVal, storesT, ubT))
       return false;
     const StoreInfo &s = storesS.front(), &t = storesT.front();
+
+    auto boolOrFalse = [&](Value v) -> Value {
+      if (v)
+        return v;
+      return smt::BoolConstantOp::create(builder, loc,
+                                         smt::BoolType::get(ctx),
+                                         builder.getBoolAttr(false))
+          .getResult();
+    };
 
     Value assertion;
     if (mode == 0) {
@@ -1135,21 +1298,12 @@ void ConvertTritonToSMT::runOnOperation() {
       Value dt = smt::DistinctOp::create(builder, loc, t.offset, iVal).getResult();
       assertion = smt::OrOp::create(builder, loc, ds, dt).getResult();
     } else if (mode == 1) {
-      // Well-definedness: assert the negation of the conjunction of all
-      // collected conditions (both functions). unsat => no input can reach a
-      // poison case (e.g. an oversized shift), so the total SMT encodings are
-      // faithful. With no conditions the scope is trivially unsat.
-      if (wdConds.empty()) {
-        assertion = smt::BoolConstantOp::create(
-                        builder, loc, smt::BoolType::get(ctx),
-                        builder.getBoolAttr(false))
-                        .getResult();
-      } else {
-        Value conj = wdConds.front();
-        for (size_t k = 1; k < wdConds.size(); ++k)
-          conj = smt::AndOp::create(builder, loc, conj, wdConds[k]).getResult();
-        assertion = smt::NotOp::create(builder, loc, conj).getResult();
-      }
+      // UB-domain equality: assert the two UB predicates differ somewhere.
+      // unsat => both functions are UB on exactly the same inputs. Trivially
+      // unsat when neither function can be UB.
+      assertion = smt::DistinctOp::create(builder, loc, boolOrFalse(ubS),
+                                          boolOrFalse(ubT))
+                      .getResult();
     } else {
       // Compare the final state of every written output array at index i.
       auto finalOf = [&](const StoreInfo &st, Value arr) -> Value {
@@ -1177,6 +1331,16 @@ void ConvertTritonToSMT::runOnOperation() {
       for (size_t k = 1; k < diffs.size(); ++k)
         assertion =
             smt::OrOp::create(builder, loc, assertion, diffs[k]).getResult();
+      // Outputs need only agree where neither function is UB (bidirectional
+      // refinement); on the -- provably shared, per scope 1 -- UB domain any
+      // behavior is allowed.
+      for (Value ub : {ubS, ubT})
+        if (ub)
+          assertion = smt::AndOp::create(
+                          builder, loc,
+                          smt::NotOp::create(builder, loc, ub).getResult(),
+                          assertion)
+                          .getResult();
     }
     smt::AssertOp::create(builder, loc, assertion);
 
@@ -1187,7 +1351,7 @@ void ConvertTritonToSMT::runOnOperation() {
     return true;
   };
 
-  if (!buildScope(/*addressing=*/0) || !buildScope(/*well-definedness=*/1) ||
+  if (!buildScope(/*addressing=*/0) || !buildScope(/*ub-domain=*/1) ||
       !buildScope(/*equivalence=*/2))
     return signalPassFailure();
 

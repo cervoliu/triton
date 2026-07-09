@@ -115,8 +115,9 @@ rounds; report in `phase-2-review.md`):
   never reports EQUIVALENT unless scopes 0 and 1 are both unsat
   (`EquivalenceResult.wd_status`).
 - A constant or masked shift amount (`x & 31`) proves WD for all inputs and
-  validates; an unbounded amount is UNSUPPORTED — even for syntactically
-  identical kernels.
+  validates; an unbounded amount was UNSUPPORTED — even for syntactically
+  identical kernels. *(Superseded by milestone 3: refinement semantics now
+  accept identical UB domains.)*
 - `extui` generalized beyond `i1` (zext via concat), `extsi` added (sext via
   ite+concat; `i1` → 0/−1), `trunci` added (extract; to-`i1` takes the low bit
   into `smt.bool`).
@@ -125,6 +126,29 @@ rounds; report in `phase-2-review.md`):
   buffer could prove a false EQUIVALENT); verifier-valid `vector<...>`,
   `index`, and `i0` types are rejected up front instead of crashing; an
   unrepresentable driver timeout degrades to UNKNOWN.
+
+## Third milestone — equivalence as bidirectional refinement (DONE)
+
+Backlog item 3, implemented on top of milestone 2's scope machinery:
+
+- **Exact per-value poison tracking.** `EncodedValue` carries an optional
+  poison predicate (and per-lane predicates in reduction mode). Ops propagate
+  poison exactly: any-operand-poison for all pure elementwise ops except
+  `select` (`p(c) ∨ ite(c, p(t), p(f))`); shifts add `amt ≥u width`; loaded
+  memory values are never poison; a masked-out lane takes `other`'s poison.
+- **UB = poison reaching memory.** A load/store contributes
+  `p(mask) ∨ (mask ∧ (p(addr) ∨ p(value)))` to the function's UB predicate.
+  Masked-out poison is *not* UB — this exactness is load-bearing: a coarse
+  global well-definedness conjunction cannot distinguish dead poison from
+  stored poison and would report a false EQUIVALENT for the dead-vs-stored
+  pair (pinned by `test_dead_vs_stored_poison_not_equivalent`).
+- **Query.** Scope 1 now asserts `UB_src ≠ UB_tgt` (unsat ⇒ identical UB
+  domains); scope 2 asserts outputs differ on an input where neither side is
+  UB. Together: bidirectional refinement. Identical-UB kernels (same
+  unbounded shift) are EQUIVALENT — matching mlir-tv — and a kernel that is
+  UB where the other is defined is NOT_EQUIVALENT
+  (`EquivalenceResult.ub_status = "sat"`). Kernels without poison sources
+  reduce to the previous query exactly.
 
 ## Working method
 
