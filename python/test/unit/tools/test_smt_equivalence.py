@@ -1087,3 +1087,69 @@ def test_reduce_with_shifted_addressing_equivalent():
     assert res.equivalent, (res.verdict, res.wd_status,
                             res.equivalence_status)
     assert res.wd_status == "unsat", res.wd_status
+
+
+# --- Codex review round 1 (phase-2 milestone 2) regression tests. ---
+
+# P1: storing a raw i1 value through a ptr<i8>->ptr<i1> bitcast into a
+# byte-observable i8 buffer. Lowerings disagree on the written byte (NVIDIA
+# sign-extends i1 to 0xff), so modeling it as 0x01 would prove this kernel
+# equivalent to one storing literal 1. Must be rejected.
+_STORE_I1_INTO_I8 = _mod("""
+  tt.func public @k(%a: !tt.ptr<i32>, %o: !tt.ptr<i8>, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pa = tt.addptr %a, %idx : !tt.ptr<i32>, i32
+    %x = tt.load %pa, %m, %c0 : !tt.ptr<i32>
+    %b = arith.cmpi ne, %x, %c0 : i32
+    %ob = tt.bitcast %o : !tt.ptr<i8> -> !tt.ptr<i1>
+    %po = tt.addptr %ob, %idx : !tt.ptr<i1>, i32
+    tt.store %po, %b, %m : !tt.ptr<i1>
+    tt.return
+  }""")
+_STORE_ONE_INTO_I8 = _mod("""
+  tt.func public @k(%a: !tt.ptr<i32>, %o: !tt.ptr<i8>, %n: i32) {
+    %c0 = arith.constant 0 : i32
+    %c0_8 = arith.constant 0 : i8
+    %c1_8 = arith.constant 1 : i8
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pa = tt.addptr %a, %idx : !tt.ptr<i32>, i32
+    %x = tt.load %pa, %m, %c0 : !tt.ptr<i32>
+    %b = arith.cmpi ne, %x, %c0 : i32
+    %r = arith.select %b, %c1_8, %c0_8 : i8
+    %po = tt.addptr %o, %idx : !tt.ptr<i8>, i32
+    tt.store %po, %r, %m : !tt.ptr<i8>
+    tt.return
+  }""")
+
+
+def test_reject_i1_store_into_byte_buffer():
+    res = tv.check_equivalence(_STORE_I1_INTO_I8, _STORE_ONE_INTO_I8)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+    # And the trunci-to-i1 variant of the same pattern.
+    src = _STORE_I1_INTO_I8.replace("arith.cmpi ne, %x, %c0 : i32",
+                                    "arith.trunci %x : i32 to i1")
+    res = tv.check_equivalence(src, _STORE_ONE_INTO_I8)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+# P2: verifier-valid vector<...> types (not ranked tensors) reached
+# getIntOrFloatBitWidth() and crashed; they must be rejected gracefully.
+_VECTOR_TYPED_CAST = _mod("""
+  tt.func public @k(%o: !tt.ptr<i32>, %n: i32) {
+    %v = arith.constant dense<7> : vector<4xi8>
+    %w = arith.extui %v : vector<4xi8> to vector<4xi32>
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %po = tt.addptr %o, %idx : !tt.ptr<i32>, i32
+    tt.store %po, %c0, %m : !tt.ptr<i32>
+    tt.return
+  }""")
+
+
+def test_reject_vector_typed_ops():
+    res = tv.check_equivalence(_VECTOR_TYPED_CAST, _VECTOR_TYPED_CAST)
+    assert res.verdict == "UNSUPPORTED", res.verdict

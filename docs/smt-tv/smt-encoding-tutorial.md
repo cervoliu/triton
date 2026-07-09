@@ -424,7 +424,8 @@ applied to different arguments). The unit test
 | `arith.uitofp i1→float` | `ite(b, 1.0, 0.0)` |
 | `tt.bitcast ptr→ptr` | identity on (array, offset); sorts reconciled at the load/store |
 | store `iN` into an `i1` buffer | value `≠ 0` (byte-backed bool: 0 = false, nonzero = true) |
-| load `iN` from an `i1` buffer | `ite(b, 1, 0)` |
+| store `i1` into an `iN` buffer | **rejected** (lowerings disagree on the written byte: NVIDIA sign-extends to `0xff`) |
+| load at a different sort than the buffer | **rejected** (the ideal value cannot represent the raw byte) |
 
 All *other* casts (`extsi`, `trunci`, `extf`, `truncf`, `sitofp`, value-level
 bitcasts, …) remain rejected — widening a bool for storage is

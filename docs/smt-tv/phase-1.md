@@ -51,8 +51,11 @@ and will not compile the pass. This is an accepted build-integration dependency
 `arith.mulf/addf/subf/negf/divf`, `math.fma`, `math.absf`, `arith.cmpf`,
 `arith.select`, `arith.maxnumf/maximumf/minnumf/minimumf`, `tt.store`;
 bool-to-storage idioms: `arith.extui`/`arith.uitofp` from `i1`, and
-pointer-to-pointer `tt.bitcast` with Bool<->bit-vector coercion at the
-load/store boundary (byte-backed `i1` buffers: 0 = false, nonzero = true).
+pointer-to-pointer `tt.bitcast` with a bit-vector→Bool coercion at the *store*
+boundary (byte-backed `i1` buffers: 0 = false, nonzero = true). The reverse
+direction — storing a raw `i1` value into a byte-observable `iN` buffer — is
+rejected: real lowerings disagree on the written byte (NVIDIA sign-extends to
+`0xff`). Reinterpreting *loads* through a bitcast are likewise rejected.
 The bitwise ops `andi/ori/xori` dispatch on the operand sort: bit-vector ops
 for `iN`, boolean `smt.and/or/xor` for `i1` masks. `arith.divf` uses SMT-LIB
 real division, which is total but unspecified at zero denominators — both
@@ -110,8 +113,10 @@ unsupported inputs; it declines to answer.
 - pointer bitcasts that change the pointee representation or byte size — only a
   same-byte-size integer reinterpretation (the `i1`↔`i8` byte-backed-bool idiom)
   is kept; float-format and element-size changes are rejected;
-- integer division / remainder / shift (`divsi`/`divui`/`remsi`/`remui`/`shl`/
-  `shrsi`/`shrui`) — their UB (division by zero, oversized shift) is not modeled,
+- integer division / remainder (`divsi`/`divui`/`remsi`/`remui`) — their UB
+  (division by zero, signed overflow) is not modeled. (Shifts were rejected in
+  phase 1 for the same reason; phase-2 milestone 2 now models them with a
+  solver-discharged well-definedness condition — see `phase-2.md`.)
   so they are rejected rather than encoded as total bit-vector ops;
 - masked loads without a fallback `other` (masked-out lanes are undefined);
 - `tt.make_range` whose extent disagrees with the store's lane count;

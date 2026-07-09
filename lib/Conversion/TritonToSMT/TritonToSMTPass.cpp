@@ -273,17 +273,18 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
     return smt::RealConstantOp::create(b, loc, R, b.getStringAttr(s))
         .getResult();
   };
-  // Reconcile a value with an expected SMT sort at a load/store boundary.
-  // Bool<->bit-vector coercions model byte-backed i1 buffers (reading: zero is
-  // false, nonzero is true; writing: true is stored as 1). Returns null for
-  // incompatible sorts.
+  // Reconcile a stored value with the buffer's declared SMT sort at a store
+  // through a pointer bitcast. Only the bit-vector -> Bool direction (the
+  // frontend's extui+bitcast idiom writing a byte into an i1-declared buffer,
+  // read back as zero=false / nonzero=true) is modeled. The reverse direction
+  // -- storing a raw i1 value into a byte-observable iN buffer -- is NOT
+  // modeled: real lowerings disagree on the written byte (NVIDIA sign-extends
+  // i1 to 0xff; "store true as 0x01" would prove a kernel equivalent to one
+  // storing literal 1, which real memory distinguishes). Returns null for
+  // any other sort mismatch, which the caller rejects.
   auto coerce = [&](Value v, Type sort) -> Value {
     if (v.getType() == sort)
       return v;
-    if (isa<smt::BoolType>(v.getType()))
-      if (auto bvTy = dyn_cast<smt::BitVectorType>(sort))
-        return ite(v, bvc(APInt(bvTy.getWidth(), 1)),
-                   bvc(APInt(bvTy.getWidth(), 0)));
     if (auto bvTy = dyn_cast<smt::BitVectorType>(v.getType()))
       if (isa<smt::BoolType>(sort))
         return bnot(beq(v, bvc(APInt(bvTy.getWidth(), 0))));
@@ -666,6 +667,22 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
 
   for (Operation &opRef : entry) {
     Operation *op = &opRef;
+
+    // Only scalars and ranked tensors are modeled. Any other shaped type
+    // (e.g. vector<4xi32>, which is verifier-valid for arith ops) would flow
+    // through elemOf() unstripped and crash width queries downstream; reject
+    // it up front.
+    auto badType = [](Type t) {
+      return isa<ShapedType>(t) && !isa<RankedTensorType>(t);
+    };
+    for (Type t : op->getOperandTypes())
+      if (badType(t))
+        return err(op, "unsupported shaped operand type (only ranked tensors "
+                       "are modeled)");
+    for (Type t : op->getResultTypes())
+      if (badType(t))
+        return err(op, "unsupported shaped result type (only ranked tensors "
+                       "are modeled)");
 
     // Reduction mode: intercept the ops that must be materialized per-lane or
     // folded, before the scalar elementwise TypeSwitch. Everything scalar
