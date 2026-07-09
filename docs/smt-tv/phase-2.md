@@ -150,7 +150,7 @@ Backlog item 3, implemented on top of milestone 2's scope machinery:
   (`EquivalenceResult.ub_status = "sat"`). Kernels without poison sources
   reduce to the previous query exactly.
 
-## Fourth milestone — validation-methodology reuse (DONE)
+## Fourth milestone — validation-methodology reuse (DONE, review-approved)
 
 Backlog item 4: `python/triton/tools/smt_validate_passes.py` sweeps a TTIR
 corpus, runs each function through semantics-preserving passes

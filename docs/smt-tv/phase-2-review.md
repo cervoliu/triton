@@ -1,23 +1,25 @@
-# Review: Phase 2 milestone 3 — exact poison tracking and bidirectional refinement
+# Review: Phase 2 milestones 2–4 — milestone-4 sweep harness round 5
 
 ## Verdict
 
-**Approved.** No soundness hole, crash path, or fail-open verdict was identified within milestone 3's supported validation contract.
-
-This review was static-only as requested. No commands were run and no files were modified.
+**Approved.** No blocking soundness or measurement-integrity issue remains within milestone 4’s documented exploratory/default-sweep scope.
 
 ## Progress since the previous review
 
-Commit `a01fcc042` replaces the milestone-2 blanket well-definedness requirement with exact per-value poison tracking in `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp`.
+Commit `0a8557441` closes both round-4 findings:
 
-Each scalar or tensor lane is represented by an `EncodedValue` carrying both its SMT value and poison predicate. Program equivalence is now checked as equality of deterministic partial functions:
+- Nested-module headers are parsed grammatically: an optional bare or quoted symbol is consumed before an exact `attributes` keyword is recognized.
+- Malformed module headers produce fatal discovery errors.
+- Regressions cover `module @attributes`, `module @"attributes"`, and `module @attributes attributes {...}`.
+- Pass entries must match the complete ASCII leaf-token expression `^[A-Za-z0-9][A-Za-z0-9-]*$`.
+- Nested pipelines, option syntax, commas, braces, dots, whitespace, and driver flags cannot occupy the leaf-pass slot.
+- Pipeline-grammar attacks now produce configuration errors.
 
-1. Scope 1 searches for an input where source and target UB differ.
-2. Scope 2 searches for an observable output difference where neither program reaches UB.
+The default sweeps remain stable at 596 attempts, 40 `EQUIVALENT`, zero `NOT_EQUIVALENT`, and zero split/discovery errors, with exit status zero.
 
-The driver in `python/triton/tools/smt_equivalence.py::check_equivalence` treats a satisfiable UB-difference query as `NOT_EQUIVALENT`.
+Milestones 2 and 3 remain approved because this commit does not change the encoder or refinement driver semantics.
 
-Caller-supplied evidence reports `scripts/smt-verify.sh` green with 62 pytest cases and 4 lit tests.
+Caller-supplied evidence reports `scripts/smt-verify.sh` green with 77 pytest cases and 4 lit tests. No reproducer was executed during this static review.
 
 ## Findings
 
@@ -25,56 +27,64 @@ No findings.
 
 ## Validation summary
 
-### Poison propagation
+### Milestone 2
 
-The supported operations preserve poison at the same scalar or tensor-lane granularity as their values:
+The previously approved conclusions remain unchanged:
 
-- Constants and `tt.make_range` begin non-poison.
-- Strict arithmetic, comparisons, casts, and pointer arithmetic disjoin the corresponding operands' poison.
-- Shape transformations duplicate or permute poison in the same way they transform payload values.
-- Integer extension and truncation preserve their input poison, including the special SMT-Bool representation of `i1`.
-- Shifts add the unsigned `amount >= bitwidth` poison condition to operand poison.
-- Unsupported poison-generating flags remain rejection cases rather than being silently encoded as unflagged operations.
+- Shift poison uses the unsigned width bound.
+- Unsupported shift and cast poison-generating flags are rejected.
+- `extui`, `extsi`, and `trunci` retain fixed-width semantics, including `i1`.
+- The raw-`i1` store, shaped-type, `index`, `i0`, and timeout failures remain fixed.
 
-The `arith.select` rule is exact:
+### Milestone 3
 
-```text
-p(result) = p(condition) OR ite(condition, p(true), p(false))
-```
+The previously approved conclusions remain unchanged:
 
-Consequently, poison in an unselected arm is suppressed, while a poisoned condition poisons the result independently of the condition's arbitrary SMT payload. Scalar conditions selecting tensor values must apply this same condition and condition-poison predicate to every result lane.
+- Poison is tracked per scalar or tensor lane.
+- `select` suppresses poison only in its unselected arm.
+- Masks gate pointer and stored-value poison exactly at memory sinks.
+- Scope 1 compares UB domains; scope 2 compares outputs only where neither program is UB.
+- Identical UB domains are accepted under bidirectional refinement.
 
-Reduction encoding carries each lane's complete `EncodedValue` through the combiner region and `tt.reduce.return`. Poison is not pre-aggregated across unrelated rows or results, so a poisoned lane cannot contaminate an independent reduction result.
+### Milestone 4
 
-### Memory sinks and mask gating
+The structural-accounting path now fails closed for the reviewed grammar:
 
-The load/store rules distinguish poison that reaches an active memory operation from poison in an inactive operand:
+- Strings and attribute dictionaries cannot create false function starts.
+- Ordinary and symbol-bearing nested modules are traversed.
+- `attributes` is recognized by grammar position rather than a text suffix.
+- Invalid module headers produce discovery errors.
+- Per-file reconciliation caught the earlier 22-definition regression and the restored aggregate is pinned by corpus regressions.
 
-- An unmasked load reaches UB exactly when its pointer is poison.
-- An active masked-load lane reaches UB when its pointer is poison.
-- A poison mask reaches UB regardless of the mask payload.
-- An inactive masked-load lane ignores pointer poison and takes the selected `other` value's poison.
-- A successfully loaded active value is non-poison.
-- An unmasked store reaches UB when its pointer or stored value is poison.
-- A masked store gates pointer and stored-value poison on the mask value, while mask poison remains unconditional UB.
-- `tt.addptr` propagates base-pointer and offset poison lane by lane; the resulting pointer poison is consumed only if that pointer reaches an active load or store.
+The pass interface is now appropriately constrained:
 
-These distinctions prevent both under-approximation and over-approximation. Under-approximation could hide a real UB-domain difference; over-approximation could exclude a genuinely defined input and thereby hide a later observable output difference.
+- Default passes are explicitly listed in `python/triton/tools/smt_validate_passes.py:29-31`.
+- Pass names receive a whole-string ASCII validation before pipeline construction at `python/triton/tools/smt_validate_passes.py:242-250`.
+- Only the validated atomic token is embedded in the fixed module pipeline at `python/triton/tools/smt_validate_passes.py:251-260`.
+- Invalid pipeline names produce configuration failure.
+- Even if diagnostic wording changes and an invalid name degrades to `PASS_ERROR`, the per-pass all-`PASS_ERROR` guard at `python/triton/tools/smt_validate_passes.py:379-384` prevents a successful sweep.
+- The two Triton-specific defaults are registered as module transformations in `include/triton/Dialect/Triton/Transforms/Passes.td:6` and `:25`.
 
-### Refinement queries
+Aggregation remains fail-closed for conclusive evidence:
 
-Let D_P(x) = ¬UB_P(x). The two scopes establish bidirectional refinement:
+- Any observed `NOT_EQUIVALENT` fails the sweep.
+- Split or discovery errors fail the sweep.
+- Missing input, empty pass lists, zero attempts, and all-`PASS_ERROR` configurations fail.
+- `PASS_ERROR`, `UNSUPPORTED`, and `UNKNOWN` cannot overwrite an observed counterexample.
 
-- `UB_src != UB_tgt` is satisfiable exactly when the programs have different defined-input domains.
-- `!UB_src && !UB_tgt && outputsDiffer` is satisfiable exactly when their observations differ on the common defined domain.
+The documentation’s empirical claim is appropriately bounded:
 
-Treating programs as equivalent on inputs where both reach UB is defensible: neither refinement direction constrains behavior outside its source program's defined domain. The programs need not reach UB at the same instruction or for the same poison cause; only equality of their aggregate defined domains is semantically relevant.
+- There were 596 attempted function-pass pairs.
+- Only the 40 `EQUIVALENT` pairs are semantically decided.
+- Zero semantic counterexamples were observed.
+- The other 556 outcomes remain explicitly inconclusive.
+- Module-alias-induced `PASS_ERROR` is documented as a coverage limitation rather than evidence of pass correctness.
+- The 40/40 result for the four `triton_to_smt*.mlir` files is supported by per-function reconciliation.
 
-The driver result mapping is sound:
+Two residual boundaries do not warrant blocking this exploratory milestone:
 
-- UB-difference `sat` → `NOT_EQUIVALENT`.
-- Output-difference `sat` after UB-domain equality → `NOT_EQUIVALENT`.
-- Both scopes `unsat` → `EQUIVALENT`.
-- Any required `unknown`, malformed result, timeout, launch failure, or rejected translation → `UNKNOWN` or a clean validation error, never `EQUIVALENT`.
+- The structural scanner is not a complete MLIR parser for arbitrary modules nested beneath unrelated region-bearing operations. No such case was tied to the reviewed default corpus or its claims.
+- A custom registered atomic analysis or no-op pass may legitimately produce identity output. The published result concerns the four reviewed default transformations and does not claim that every custom pass rewrites every input.
 
-No attack considered during the static audit met the threshold for a repository-grounded `PLAUSIBLE-UNREPRODUCED` finding, so no reproducer is included.
+No candidate met the threshold for a repository-grounded `PLAUSIBLE-UNREPRODUCED` finding.
+
