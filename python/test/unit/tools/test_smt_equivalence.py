@@ -1300,3 +1300,47 @@ def test_pass_validation_rejects_out_of_contract():
     verdict, _ = vp.validate_pass(fn, "canonicalize", tv.default_triton_opt(),
                                   timeout=60.0)
     assert verdict == "UNSUPPORTED", verdict
+
+
+# Codex milestone-4 review round 1: split_funcs must parse tt.func headers
+# (arg/result/function attribute dicts, external declarations) rather than
+# grabbing the first brace, and must account for every tt.func.
+def test_split_funcs_header_forms():
+    from triton.tools.smt_validate_passes import _split_structured
+    ttir = """module {
+  tt.func public @first(%p: !tt.ptr<i32> {tt.divisibility = 16 : i32}) {
+    tt.return
+  }
+  tt.func private @external()
+  tt.func public @res() -> (i32 {tt.foo}) attributes {noinline = false} {
+    %c = arith.constant 0 : i32
+    tt.return %c : i32
+  }
+  tt.func private @trailing_decl(i32)
+}
+"""
+    r = _split_structured(ttir)
+    assert len(r.defs) == 2, r.defs
+    assert len(r.decls) == 2, r.decls
+    assert not r.errors, r.errors
+    assert r.defs[0].startswith("tt.func public @first")
+    assert r.defs[0].rstrip().endswith("}") and "tt.return" in r.defs[0]
+    assert r.defs[1].startswith("tt.func public @res")
+    assert "tt.return %c" in r.defs[1]
+
+
+def test_split_funcs_reduce_corpus_file():
+    from pathlib import Path
+    from triton.tools.smt_validate_passes import _split_structured
+    corpus = Path(__file__).resolve().parents[4] / "test" / "Conversion"
+    r = _split_structured((corpus / "triton_to_smt_reduce.mlir").read_text())
+    assert len(r.defs) == 2 and not r.errors, (len(r.defs), r.errors)
+    assert all("tt.reduce" in f and "tt.return" in f for f in r.defs)
+
+
+def test_split_funcs_error_is_recorded_not_dropped():
+    from triton.tools.smt_validate_passes import _split_structured
+    # Unbalanced body brace: must surface as an error entry, not a silent
+    # break that hides subsequent functions.
+    r = _split_structured("module {\n  tt.func public @bad() { %c =\n}\n")
+    assert r.errors, r

@@ -160,19 +160,30 @@ mlir-tv validated MLIR's unit-test pairs. Out-of-contract functions are
 counted as UNSUPPORTED (never silently skipped); any NOT_EQUIVALENT fails the
 sweep (a pass bug or a checker bug — both reportable).
 
-First sweep results (2026-07-09):
+The harness keeps its accounting units separate (review round 1 finding):
+file-level (parse-skipped files), function-level (definitions vs external
+declarations vs split errors — a split error fails the sweep), and
+attempt-level (one record per definition × pass, the only unit verdict
+counts are meaningful in). `tt.func` headers are parsed precisely
+(argument/result/function attribute dicts, bodyless declarations) rather
+than brace-matched naively.
 
-| corpus | funcs×passes | EQUIVALENT | UNSUPPORTED | PASS_ERROR | PARSE_SKIP | NOT_EQUIVALENT |
-|---|---|---|---|---|---|---|
-| `test/Triton` | 285 | 0 | 260 | 20 | 5 | 0 |
-| `test/Conversion` | 330 | 32 | 88 | 196 | 14 | 0 |
+Sweep results (2026-07-09, 4 passes; non-recursive over each directory):
 
+| corpus | files (parse-skipped) | definitions | attempts | EQUIVALENT | UNSUPPORTED | PASS_ERROR | NOT_EQUIVALENT |
+|---|---|---|---|---|---|---|---|
+| `test/Triton` | 13 (5) | 70 | 280 | 0 | 276 | 4 | 0 |
+| `test/Conversion` | 36 (14) | 79 | 316 | 40 | 108 | 168 | 0 |
+
+Zero NOT_EQUIVALENT among the 596 attempted pairs; 40 decided EQUIVALENT;
+the remaining categories are *inconclusive coverage*, not validation.
 `test/Triton` is dominated by out-of-contract constructs (`scf.for`,
 non-void lit-snippet functions, `tt.dot`, tensor descriptors), matching
-mlir-tv's partial-coverage experience; the in-contract kernels in
-`test/Conversion/triton_to_smt*.mlir` all validate EQUIVALENT under every
-pass. No pass bug surfaced. Growing the EQUIVALENT column is exactly the
-phase-3 coverage agenda (loops, `tt.dot`, stride-general addressing).
+mlir-tv's partial-coverage experience. Per-function results confirm every
+definition in `test/Conversion/triton_to_smt*.mlir` is EQUIVALENT under
+all four passes (8+16+8+8 = 40/40). No pass bug surfaced. Growing the
+EQUIVALENT column is the phase-3 coverage agenda (loops, `tt.dot`,
+stride-general addressing).
 
 ## Working method
 

@@ -113,11 +113,11 @@ def _run(cmd, stdin_text: str, timeout: Optional[float] = None) -> str:
 _FUNC_RE = re.compile(r'(tt\.func\s+(?:public\s+|private\s+)?)@(?:\w+|"[^"]*")')
 
 
-def _skip_balanced(text: str, i: int) -> int:
-    """Given text[i] == '{', return the index just past the matching '}'.
+def _skip_balanced(text: str, i: int, open: str = "{", close: str = "}") -> int:
+    """Given text[i] == open, return the index just past the matching close.
 
-    String literals are skipped so braces inside quoted attribute values do not
-    confuse the balance.
+    String literals are skipped so delimiters inside quoted attribute values do
+    not confuse the balance.
     """
     depth = 0
     n = len(text)
@@ -127,14 +127,14 @@ def _skip_balanced(text: str, i: int) -> int:
             i += 1
             while i < n and text[i] != '"':
                 i += 2 if text[i] == "\\" else 1
-        elif c == "{":
+        elif c == open:
             depth += 1
-        elif c == "}":
+        elif c == close:
             depth -= 1
             if depth == 0:
                 return i + 1
         i += 1
-    raise RuntimeError("unbalanced braces in TTIR input")
+    raise RuntimeError(f"unbalanced '{open}{close}' in TTIR input")
 
 
 def _module_body(text: str) -> str:
