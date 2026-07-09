@@ -1264,3 +1264,39 @@ def test_unrepresentable_timeout_is_unknown(bad):
     res = tv.check_equivalence(_TRIVIAL, _TRIVIAL, timeout=bad)
     assert res.verdict == "UNKNOWN", res.verdict
     assert res.addressing_status == "bad-timeout", res.addressing_status
+
+
+# --- Phase-2 milestone 4: pass-validation sweep harness smoke tests. ---
+
+def test_pass_validation_smoke():
+    from pathlib import Path
+    from triton.tools import smt_validate_passes as vp
+    corpus = Path(__file__).resolve().parents[4] / "test" / "Conversion"
+    text = (corpus / "triton_to_smt.mlir").read_text()
+    funcs = vp.split_funcs(text)
+    assert len(funcs) == 2, len(funcs)
+    verdict, _ = vp.validate_pass(funcs[0], "canonicalize",
+                                  tv.default_triton_opt(), timeout=60.0)
+    assert verdict == "EQUIVALENT", verdict
+
+
+def test_pass_validation_rejects_out_of_contract():
+    from triton.tools import smt_validate_passes as vp
+    # An scf.for kernel is outside the contract; the sweep must count it as
+    # UNSUPPORTED rather than skipping or crashing.
+    fn = """tt.func public @k(%o: !tt.ptr<i32>) {
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    scf.for %i = %c0 to %c4 step %c1 {
+      scf.yield
+    }
+    %z = arith.constant 0 : i32
+    %pid = tt.get_program_id x : i32
+    %p = tt.addptr %o, %pid : !tt.ptr<i32>, i32
+    tt.store %p, %z : !tt.ptr<i32>
+    tt.return
+  }"""
+    verdict, _ = vp.validate_pass(fn, "canonicalize", tv.default_triton_opt(),
+                                  timeout=60.0)
+    assert verdict == "UNSUPPORTED", verdict

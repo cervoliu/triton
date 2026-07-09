@@ -150,6 +150,30 @@ Backlog item 3, implemented on top of milestone 2's scope machinery:
   (`EquivalenceResult.ub_status = "sat"`). Kernels without poison sources
   reduce to the previous query exactly.
 
+## Fourth milestone — validation-methodology reuse (DONE)
+
+Backlog item 4: `python/triton/tools/smt_validate_passes.py` sweeps a TTIR
+corpus, runs each function through semantics-preserving passes
+(`canonicalize`, `cse`, `triton-combine`, `triton-reorder-broadcast`), and
+checks original vs transformed with the equivalence driver — mirroring how
+mlir-tv validated MLIR's unit-test pairs. Out-of-contract functions are
+counted as UNSUPPORTED (never silently skipped); any NOT_EQUIVALENT fails the
+sweep (a pass bug or a checker bug — both reportable).
+
+First sweep results (2026-07-09):
+
+| corpus | funcs×passes | EQUIVALENT | UNSUPPORTED | PASS_ERROR | PARSE_SKIP | NOT_EQUIVALENT |
+|---|---|---|---|---|---|---|
+| `test/Triton` | 285 | 0 | 260 | 20 | 5 | 0 |
+| `test/Conversion` | 330 | 32 | 88 | 196 | 14 | 0 |
+
+`test/Triton` is dominated by out-of-contract constructs (`scf.for`,
+non-void lit-snippet functions, `tt.dot`, tensor descriptors), matching
+mlir-tv's partial-coverage experience; the in-contract kernels in
+`test/Conversion/triton_to_smt*.mlir` all validate EQUIVALENT under every
+pass. No pass bug surfaced. Growing the EQUIVALENT column is exactly the
+phase-3 coverage agenda (loops, `tt.dot`, stride-general addressing).
+
 ## Working method
 
 Implement an increment → run the Codex reviewer via the plugin
