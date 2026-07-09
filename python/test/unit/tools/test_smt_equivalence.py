@@ -1153,3 +1153,38 @@ _VECTOR_TYPED_CAST = _mod("""
 def test_reject_vector_typed_ops():
     res = tv.check_equivalence(_VECTOR_TYPED_CAST, _VECTOR_TYPED_CAST)
     assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+# Codex review round 2: verifier-valid `index` constants and zero-width `i0`
+# values previously crashed width queries / built invalid !smt.bv<0>.
+_INDEX_CONSTANT = _mod("""
+  tt.func public @k(%o: !tt.ptr<i32>, %n: i32) {
+    %ix = arith.constant 7 : index
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %po = tt.addptr %o, %idx : !tt.ptr<i32>, i32
+    tt.store %po, %c0, %m : !tt.ptr<i32>
+    tt.return
+  }""")
+_I0_VALUE = _mod("""
+  tt.func public @k(%o: !tt.ptr<i32>, %n: i32) {
+    %z = arith.constant 0 : i0
+    %zz = arith.addi %z, %z : i0
+    %c0 = arith.constant 0 : i32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %po = tt.addptr %o, %idx : !tt.ptr<i32>, i32
+    tt.store %po, %c0, %m : !tt.ptr<i32>
+    tt.return
+  }""")
+
+
+def test_reject_index_constant():
+    res = tv.check_equivalence(_INDEX_CONSTANT, _INDEX_CONSTANT)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_zero_width_integer():
+    res = tv.check_equivalence(_I0_VALUE, _I0_VALUE)
+    assert res.verdict == "UNSUPPORTED", res.verdict

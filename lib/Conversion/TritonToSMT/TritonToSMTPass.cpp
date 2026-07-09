@@ -104,11 +104,15 @@ static std::optional<std::string> formatReal(APFloat value) {
   return neg ? ("(- " + body + ")") : body;
 }
 
-// Map an MLIR scalar type to its SMT sort. Returns null for unsupported types.
+// Map an MLIR scalar type to its SMT sort. Returns null for unsupported types
+// (including `index`, whose width is target-defined, and zero-width `i0`,
+// which has no valid !smt.bv<0> counterpart).
 static Type smtSortFor(Type t, MLIRContext *ctx) {
   if (isa<FloatType>(t))
     return smt::RealType::get(ctx);
   if (auto it = dyn_cast<IntegerType>(t)) {
+    if (it.getWidth() == 0)
+      return nullptr;
     if (it.getWidth() == 1)
       return smt::BoolType::get(ctx);
     return smt::BitVectorType::get(ctx, it.getWidth());
@@ -668,21 +672,31 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
   for (Operation &opRef : entry) {
     Operation *op = &opRef;
 
-    // Only scalars and ranked tensors are modeled. Any other shaped type
-    // (e.g. vector<4xi32>, which is verifier-valid for arith ops) would flow
-    // through elemOf() unstripped and crash width queries downstream; reject
-    // it up front.
-    auto badType = [](Type t) {
-      return isa<ShapedType>(t) && !isa<RankedTensorType>(t);
+    // Only scalars and ranked tensors are modeled, and only integer widths
+    // with a valid SMT counterpart. Verifier-valid inputs can otherwise crash
+    // width queries downstream: vector<4xi32> flows through elemOf()
+    // unstripped, a scalar `index` constant asserts in
+    // getIntOrFloatBitWidth(), and `i0` would construct an invalid
+    // !smt.bv<0>. Reject them all up front.
+    auto badType = [&](Type t) {
+      if (isa<ShapedType>(t) && !isa<RankedTensorType>(t))
+        return true;
+      Type e = elemOf(t);
+      if (isa<IndexType>(e))
+        return true;
+      auto it = dyn_cast<IntegerType>(e);
+      return it && it.getWidth() == 0;
     };
     for (Type t : op->getOperandTypes())
       if (badType(t))
-        return err(op, "unsupported shaped operand type (only ranked tensors "
-                       "are modeled)");
+        return err(op, "unsupported operand type (only ranked tensors of "
+                       "nonzero-width integers, floats, and pointers are "
+                       "modeled)");
     for (Type t : op->getResultTypes())
       if (badType(t))
-        return err(op, "unsupported shaped result type (only ranked tensors "
-                       "are modeled)");
+        return err(op, "unsupported result type (only ranked tensors of "
+                       "nonzero-width integers, floats, and pointers are "
+                       "modeled)");
 
     // Reduction mode: intercept the ops that must be materialized per-lane or
     // folded, before the scalar elementwise TypeSwitch. Everything scalar
