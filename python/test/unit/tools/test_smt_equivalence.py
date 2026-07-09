@@ -1456,3 +1456,38 @@ def test_split_funcs_nested_modules():
 """
     r = _split_structured(ttir)
     assert len(r.defs) == 2 and not r.errors, (len(r.defs), r.errors)
+
+
+# Codex milestone-4 review round 4: module symbols colliding with the
+# `attributes` keyword, and pipeline grammar in pass entries.
+def test_split_funcs_module_named_attributes():
+    from triton.tools.smt_validate_passes import _split_structured
+    base = """module {{
+  module {header} {{
+    tt.func public @victim(%o: !tt.ptr<i32>) {{
+      %z = arith.constant 0 : i32
+      tt.store %o, %z : !tt.ptr<i32>
+      tt.return
+    }}
+  }}
+  tt.func public @anchor() {{
+    tt.return
+  }}
+}}
+"""
+    for header in ('@attributes', '@"attributes"',
+                   '@attributes attributes {ttg.target = "cuda:80"}'):
+        r = _split_structured(base.format(header=header))
+        assert len(r.defs) == 2 and not r.errors, (header, len(r.defs),
+                                                   r.errors)
+        assert any("@victim" in d.split("{", 1)[0] for d in r.defs), header
+
+
+def test_pipeline_grammar_is_not_a_pass():
+    from triton.tools import smt_validate_passes as vp
+    fn = "tt.func public @k() { tt.return }"
+    for bad in ("builtin.module(canonicalize)", "func.func(canonicalize)",
+                "canonicalize{max-iterations=1}", "canonicalize,cse",
+                "builtin.module()"):
+        with pytest.raises(RuntimeError, match="atomic pass name"):
+            vp.validate_pass(fn, bad, tv.default_triton_opt(), 30.0)

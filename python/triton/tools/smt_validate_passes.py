@@ -61,12 +61,41 @@ def _top_level_func_starts(body: str):
         j = i + len(tok)
         return j >= len(body) or not (body[j].isalnum() or body[j] in "_$")
 
+    def skip_ws(k):
+        while k < len(body) and body[k].isspace():
+            k += 1
+        return k
+
+    def skip_module_header(k):
+        """From just past a `module` token, return the index just past the
+        module's body `{` (descended into), parsing the header as grammar:
+        optional @symbol (bare or quoted -- a module NAMED @attributes must
+        not be confused with an attributes clause), optional `attributes`
+        keyword + dict, then the region brace."""
+        k = skip_ws(k)
+        if k < len(body) and body[k] == "@":
+            k += 1
+            if k < len(body) and body[k] == '"':
+                j = k + 1
+                while j < len(body) and body[j] != '"':
+                    j += 2 if body[j] == "\\" else 1
+                k = j + 1
+            else:
+                while k < len(body) and (body[k].isalnum() or
+                                         body[k] in "._$-"):
+                    k += 1
+            k = skip_ws(k)
+        if token_at(k, "attributes"):
+            k = skip_ws(k + len("attributes"))
+            if k >= len(body) or body[k] != "{":
+                raise RuntimeError("module `attributes` not followed by '{'")
+            k = skip_ws(tv._skip_balanced(body, k))
+        if k >= len(body) or body[k] != "{":
+            raise RuntimeError("module header not followed by a region")
+        return k + 1  # descend into the module body
+
     starts, errors = [], []
     i, n = 0, len(body)
-    # True between a nested `module` token and its body brace: that brace is
-    # DESCENDED into (modules host tt.funcs; several lit files hold multiple
-    # nested modules), whereas every other brace group is opaque.
-    module_header = False
     while i < n:
         c = body[i]
         if c == '"':
@@ -76,12 +105,6 @@ def _top_level_func_starts(body: str):
             i = j + 1
             continue
         if c == "{":
-            if module_header and body[:i].rstrip().endswith("attributes"):
-                pass  # a nested module's attribute dict: skip it, stay in header
-            elif module_header:
-                module_header = False
-                i += 1  # descend into the nested module's body
-                continue
             try:
                 i = tv._skip_balanced(body, i)
             except RuntimeError as e:
@@ -89,11 +112,13 @@ def _top_level_func_starts(body: str):
                 return starts, errors
             continue
         if token_at(i, "module"):
-            module_header = True
-            i += len("module")
+            try:
+                i = skip_module_header(i + len("module"))
+            except RuntimeError as e:
+                errors.append(f"discovery: module at offset {i}: {e}")
+                i += len("module")
             continue
         if token_at(i, "tt.func"):
-            module_header = False
             if _FUNC_HEADER.match(body, i):
                 starts.append(i)
             else:
@@ -214,6 +239,15 @@ def _parse_file(path: Path, triton_opt: str) -> Optional[str]:
 def validate_pass(func_text: str, pass_name: str, triton_opt: str,
                   timeout: float) -> tuple[str, str]:
     """Run `pass_name` on one function and check original vs transformed."""
+    # Only an atomic registered-pass name is accepted: pipeline grammar
+    # (parens, commas, braces, dots, whitespace) could nest an anchor that
+    # matches nothing in the single-function candidate -- e.g.
+    # builtin.module(canonicalize) or func.func(canonicalize) -- making an
+    # identity run look like a validated EQUIVALENT.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]*", pass_name):
+        raise RuntimeError(
+            f"{pass_name!r} is not an atomic pass name (pipeline syntax is "
+            "not accepted; the harness schedules builtin.module(<pass>))")
     src_mod = "module {\n" + func_text + "\n}\n"
     # Run through --pass-pipeline rather than --{name}: a recognized driver
     # OPTION (e.g. allow-unregistered-dialect) is a valid flag but schedules
