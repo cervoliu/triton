@@ -2,70 +2,44 @@
 
 ## Verdict
 
-**Changes requested.** Shift and cast semantics remain sound, but a type-correct oversized integer timeout can still escape the public driver API as an uncaught exception.
+**Approved.** Round 4 found no remaining soundness hole, crash path, or fail-open verdict within the supported translation-validation contract.
+
+This review was static-only as requested. No commands were run and no files were modified.
 
 ## Progress since the previous review
 
-Commit `fa48b2494` closes both round-2 type-validation holes. Scalar `index` values and zero-width integer values are now rejected before encoding; `smtSortFor` also fails closed for `i0`. The regressions `test_reject_index_constant` and `test_reject_zero_width_integer` pin these cases.
+Commit `973531529` closes the sole round-3 finding, `[P2] Oversized integer timeout escapes before an EquivalenceResult`, in `python/triton/tools/smt_equivalence.py::check_equivalence`.
 
-The earlier fixes remain intact: raw Bool-to-bit-vector stores are rejected, unsupported non-ranked shaped types fail before width queries, shift poison conditions are discharged through the dedicated well-definedness scope, and legal `extui`, `extsi`, and `trunci` operations preserve their fixed-width semantics.
+Both failure stages now degrade safely to `UNKNOWN` with a bad-timeout diagnostic:
+
+- Conversion or validation of an unrepresentably large integer no longer leaks `OverflowError`.
+- Diagnostic construction no longer calls an unsafe decimal `repr` on an integer exceeding Python’s configured digit limit.
+
+The parametrized regressions `test_unrepresentable_timeout_is_unknown[huge-int]` and `test_unrepresentable_timeout_is_unknown[str]` in `python/test/unit/tools/test_smt_equivalence.py` pin both paths.
+
+The earlier protections also remain intact:
+
+- Raw `i1`/SMT-Bool values cannot be coerced into byte-vector stores.
+- Non-ranked shaped types are rejected before encoding.
+- Dynamic-shaped stores are rejected.
+- `index` and zero-width `i0` types, including tensor element types, are rejected up front.
 
 ## Findings
 
-### [P2] Oversized integer timeout escapes before an `EquivalenceResult`
-
-**References:** `python/triton/tools/smt_equivalence.py:97-103`, `python/triton/tools/smt_equivalence.py:216-219`, `python/triton/tools/smt_equivalence.py:261-268`.
-
-**Location:** `check_equivalence` calls `math.isfinite(timeout)` before entering the exception handler that converts unrepresentable subprocess timeout values into `UNKNOWN`.
-
-**Soundness claim at risk:** the public verdict API should return an `EquivalenceResult` for invalid or unrepresentable solver timeouts rather than raising. This is a robustness failure, not a false-equivalence result.
-
-**Reproduction status: PLAUSIBLE-UNREPRODUCED.** Python accepts integers where a `float` parameter is expected, but converting an arbitrarily large integer for `math.isfinite` raises `OverflowError`. The following valid self-query should fail before any subprocess is launched:
-
-```sh
-PYTHONPATH=python .venv/bin/python - <<'PY'
-from triton.tools import smt_equivalence as tv
-
-kernel = r"""
-module {
-  tt.func public @k(%o: !tt.ptr<i32>) {
-    %zero = arith.constant 0 : i32
-    %i = tt.get_program_id x : i32
-    %p = tt.addptr %o, %i : !tt.ptr<i32>, i32
-    tt.store %p, %zero : !tt.ptr<i32>
-    tt.return
-  }
-}
-"""
-
-result = tv.check_equivalence(
-    kernel,
-    kernel,
-    timeout=10**10000,
-    triton_opt="build/cmake.macosx-26.0-arm64-cpython-3.12/bin/triton-opt",
-    mlir_translate=".llvm-project/build/bin/mlir-translate",
-    z3="z3",
-)
-print(result.verdict)
-PY
-```
-
-Expected failure:
-
-```text
-OverflowError: int too large to convert to float
-```
-
-The later solver invocation catches `OverflowError`, but this earlier validation does not.
-
-**Suggested fix:** wrap timeout normalization and `math.isfinite` in `try/except (TypeError, OverflowError)` and return the existing `UNKNOWN`/`bad-timeout` result. Add a regression using `timeout=10**10000`; optionally cover a nonnumeric value as well.
+No findings.
 
 ## Validation summary
 
-- Performed a static audit only, as required for this round.
-- The shift bound uses unsigned `amount < width`; `shli` overflow flags, right-shift `exact`, and `i1` shifts fail closed.
-- Zero extension, sign extension, odd-width casts, and low-bit truncation—including the `i1` cases—match the Arith and SMT bit-vector semantics.
-- Per-lane shifts accumulate per-lane well-definedness conditions. The driver requires exactly three solver results and cannot return `EQUIVALENT` unless addressing and well-definedness are both `unsat`.
-- No type-gate bypass, false `EQUIVALENT`, WD vacuity, signedness mismatch, or cast-width error was identified.
-- Caller-provided validation reports 56 passing pytest cases in `python/test/unit/tools/test_smt_equivalence.py` and four passing conversion lit tests through `scripts/smt-verify.sh`.
+The static audit rechecked the following soundness boundaries:
+
+- The shift encodings in `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:520-552` use an unsigned `amount < bitwidth` well-definedness condition. This correctly rejects amounts with negative-looking bit patterns and amounts equal to or greater than the width.
+- `arith.shli` overflow flags and right-shift `exact` semantics are explicitly rejected rather than silently discarded.
+- Shift well-definedness is collected per tensor lane, including the reduction encoding paths at `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:657-666` and `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:835-850`.
+- The `extui`, `extsi`, and `trunci` encodings at `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:578-626` implement zero extension, sign extension, and low-bit truncation respectively, including the explicit SMT-Bool handling required for `i1`.
+- Odd, nonzero integer widths do not alter the bit-vector semantics of shifts or intermediate extension/truncation operations.
+- `arith.extui` `nneg` and `arith.trunci` overflow flags are rejected, preventing poison-producing casts from being treated as ordinary bit-only casts.
+- The well-definedness query at `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:1123-1138` requires the conjunction of source and target side conditions. Unsupported or poison-producing cases therefore cannot reach the value-equivalence query as silently defined executions.
+- The driver requires exactly the expected three solver results and cannot return `EQUIVALENT` unless both address equivalence and well-definedness are proved with `unsat`. Invalid timeout values now return `UNKNOWN`.
+- Potential attacks involving dynamic tensor construction, sub-byte stores, `i1` memory interpretation, and timeout scaling did not yield a concrete accepted path or semantics mismatch grounded in the current implementation. None met the threshold for a `PLAUSIBLE-UNREPRODUCED` finding, so no reproducer is included.
+- Caller-supplied runtime evidence reports `scripts/smt-verify.sh` green with 58 pytest cases and 4 lit tests.
 

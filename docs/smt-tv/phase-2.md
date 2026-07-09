@@ -101,6 +101,31 @@ the reduced `N`) is rejected. Differing `N` *between* src and tgt is not a
 soundness hole and is **not** rejected: the two functions select different input
 addresses, so the equivalence query is sound and simply returns NOT_EQUIVALENT.
 
+## Second milestone — shifts + integer ext/trunc via well-definedness (DONE)
+
+Implemented (commits `728ad6b0d`..`973531529`, review-approved after 4 Codex
+rounds; report in `phase-2-review.md`):
+
+- `shli`/`shrui`/`shrsi` → total `smt.bv.shl/lshr/ashr` plus a collected
+  well-definedness condition `amt <u width` per shift (per lane in reduction
+  context). Poison flags (`nsw`/`nuw`/`exact`) are rejected.
+- The pass now always emits **three** solver scopes in fixed order:
+  0 addressing, 1 well-definedness (assert ¬(∧ conditions); trivially unsat
+  when none), 2 equivalence. The driver requires exactly three results and
+  never reports EQUIVALENT unless scopes 0 and 1 are both unsat
+  (`EquivalenceResult.wd_status`).
+- A constant or masked shift amount (`x & 31`) proves WD for all inputs and
+  validates; an unbounded amount is UNSUPPORTED — even for syntactically
+  identical kernels.
+- `extui` generalized beyond `i1` (zext via concat), `extsi` added (sext via
+  ite+concat; `i1` → 0/−1), `trunci` added (extract; to-`i1` takes the low bit
+  into `smt.bool`).
+- Review hardening: the Bool→bit-vector *store* coercion was removed (NVIDIA
+  sign-extends `i1` stores to `0xff`, so "true as 0x01" into a byte-observable
+  buffer could prove a false EQUIVALENT); verifier-valid `vector<...>`,
+  `index`, and `i0` types are rejected up front instead of crashing; an
+  unrepresentable driver timeout degrades to UNKNOWN.
+
 ## Working method
 
 Implement an increment → run the Codex reviewer via the plugin
