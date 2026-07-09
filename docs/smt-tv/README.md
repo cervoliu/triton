@@ -19,6 +19,9 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
   walking one real kernel pair through the entire pipeline.
 - [`mlir-tv-comparison.md`](mlir-tv-comparison.md) — comparison against the
   reference tool mlir-tv (Bang et al., CAV 2022) and what we can absorb from it.
+- [`fehr-2025-comparison.md`](fehr-2025-comparison.md) — comparison against
+  Fehr et al.'s first-class verification dialects (PLDI 2025): shared smt
+  foundation, poison-semantics agreement, absorb/skip decisions.
 - [`phase-2.md`](phase-2.md) — the phase-2 goal (absorb/leverage mlir-tv) and its
   first milestone: reductions.
 
