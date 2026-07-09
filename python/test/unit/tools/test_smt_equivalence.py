@@ -1188,3 +1188,22 @@ def test_reject_index_constant():
 def test_reject_zero_width_integer():
     res = tv.check_equivalence(_I0_VALUE, _I0_VALUE)
     assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+# Codex review round 3: math.isfinite itself raises on unrepresentable
+# timeouts (10**10000) or non-numbers; both must be the documented UNKNOWN.
+_TRIVIAL = _mod("""
+  tt.func public @k(%o: !tt.ptr<i32>) {
+    %z = arith.constant 0 : i32
+    %i = tt.get_program_id x : i32
+    %p = tt.addptr %o, %i : !tt.ptr<i32>, i32
+    tt.store %p, %z : !tt.ptr<i32>
+    tt.return
+  }""")
+
+
+@pytest.mark.parametrize("bad", [10**10000, "soon"], ids=["huge-int", "str"])
+def test_unrepresentable_timeout_is_unknown(bad):
+    res = tv.check_equivalence(_TRIVIAL, _TRIVIAL, timeout=bad)
+    assert res.verdict == "UNKNOWN", res.verdict
+    assert res.addressing_status == "bad-timeout", res.addressing_status

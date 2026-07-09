@@ -213,10 +213,21 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
     mlir_translate = mlir_translate or default_mlir_translate()
     z3 = z3 or default_z3()
 
-    # A non-finite timeout would raise from subprocess rather than time out.
-    if timeout is not None and not math.isfinite(timeout):
+    # A non-finite or unrepresentable timeout would raise from subprocess
+    # rather than time out. math.isfinite itself raises on values that cannot
+    # convert to float (e.g. 10**10000) or are not numbers at all; both are the
+    # same documented UNKNOWN, not an exception from the verdict API.
+    try:
+        bad_timeout = timeout is not None and not math.isfinite(timeout)
+    except (TypeError, OverflowError):
+        bad_timeout = True
+    if bad_timeout:
+        try:
+            desc = repr(timeout)  # repr(10**10000) exceeds the int-str limit
+        except Exception:
+            desc = f"<unprintable {type(timeout).__name__}>"
         return EquivalenceResult("UNKNOWN", "bad-timeout", "bad-timeout", "",
-                                 f"invalid timeout value: {timeout!r}")
+                                 f"invalid timeout value: {desc}")
 
     # Building the merged module can fail (e.g. a module that is not exactly one
     # renamable tt.func, including quoted symbols); surface that as UNSUPPORTED
