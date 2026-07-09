@@ -26,8 +26,6 @@ from triton.tools import smt_equivalence as tv
 __all__ = ["split_funcs", "validate_pass", "sweep", "FuncResult",
            "SplitResult", "SweepReport"]
 
-_FUNC_START = re.compile(r"\btt\.func\b")
-
 # Default pass set: TTIR-level transformations that must preserve semantics.
 DEFAULT_PASSES = ("canonicalize", "cse", "triton-combine",
                   "triton-reorder-broadcast")
@@ -40,6 +38,72 @@ class SplitResult:
     defs: list
     decls: list
     errors: list
+
+
+_FUNC_HEADER = re.compile(r"tt\.func(\s+(public|private|nested))?\s+@")
+
+
+def _top_level_func_starts(body: str):
+    """Find `tt.func` operation starts, skipping strings and brace groups.
+
+    A raw regex scan is not enough: `tt.func` can appear as a dialect
+    attribute NAME (`attributes {tt.func = false}`), inside a quoted symbol
+    or string attribute, or in a nested region -- all of which live inside
+    braces or quotes at this level. Every accepted start must also look like
+    a function header (`tt.func [visibility] @...`); anything else is a
+    fatal discovery error rather than a silently mis-split candidate.
+    """
+    def token_at(i, tok):
+        if not body.startswith(tok, i):
+            return False
+        if i > 0 and (body[i - 1].isalnum() or body[i - 1] in "._$"):
+            return False
+        j = i + len(tok)
+        return j >= len(body) or not (body[j].isalnum() or body[j] in "_$")
+
+    starts, errors = [], []
+    i, n = 0, len(body)
+    # True between a nested `module` token and its body brace: that brace is
+    # DESCENDED into (modules host tt.funcs; several lit files hold multiple
+    # nested modules), whereas every other brace group is opaque.
+    module_header = False
+    while i < n:
+        c = body[i]
+        if c == '"':
+            j = i + 1
+            while j < n and body[j] != '"':
+                j += 2 if body[j] == "\\" else 1
+            i = j + 1
+            continue
+        if c == "{":
+            if module_header and body[:i].rstrip().endswith("attributes"):
+                pass  # a nested module's attribute dict: skip it, stay in header
+            elif module_header:
+                module_header = False
+                i += 1  # descend into the nested module's body
+                continue
+            try:
+                i = tv._skip_balanced(body, i)
+            except RuntimeError as e:
+                errors.append(f"discovery: {e}")
+                return starts, errors
+            continue
+        if token_at(i, "module"):
+            module_header = True
+            i += len("module")
+            continue
+        if token_at(i, "tt.func"):
+            module_header = False
+            if _FUNC_HEADER.match(body, i):
+                starts.append(i)
+            else:
+                errors.append(
+                    f"discovery: top-level 'tt.func' at offset {i} is not a "
+                    f"function header: {body[i:i + 60]!r}")
+            i += len("tt.func")
+            continue
+        i += 1
+    return starts, errors
 
 
 def _find_body_brace(body: str, start: int, limit: int):
@@ -107,7 +171,8 @@ def _split_structured(module_text: str) -> SplitResult:
     except RuntimeError as e:
         res.errors.append(f"module: {e}")
         return res
-    starts = [m.start() for m in _FUNC_START.finditer(body)]
+    starts, disc_errors = _top_level_func_starts(body)
+    res.errors.extend(disc_errors)
     for idx, start in enumerate(starts):
         limit = starts[idx + 1] if idx + 1 < len(starts) else len(body)
         try:
@@ -150,15 +215,21 @@ def validate_pass(func_text: str, pass_name: str, triton_opt: str,
                   timeout: float) -> tuple[str, str]:
     """Run `pass_name` on one function and check original vs transformed."""
     src_mod = "module {\n" + func_text + "\n}\n"
+    # Run through --pass-pipeline rather than --{name}: a recognized driver
+    # OPTION (e.g. allow-unregistered-dialect) is a valid flag but schedules
+    # no transformation, so it would certify an identity run as EQUIVALENT.
+    # Pipeline syntax only admits registered passes, and rejects anything
+    # else before touching the input -- a configuration error, not a
+    # per-function result.
+    pipeline = f"--pass-pipeline=builtin.module({pass_name})"
     try:
-        tgt_mod = tv._run([triton_opt, f"--{pass_name}"], src_mod)
+        tgt_mod = tv._run([triton_opt, pipeline], src_mod)
     except RuntimeError as e:
-        # A pass that triton-opt does not even recognize is a configuration
-        # error, not a per-function result; letting it degrade to PASS_ERROR
-        # would let a misspelled pass name produce a green zero-work sweep.
-        if "Unknown command line argument" in str(e):
+        if ("does not refer to a registered pass" in str(e)
+                or "failed to parse pass pipeline" in str(e)
+                or "Unknown command line argument" in str(e)):
             raise RuntimeError(
-                f"triton-opt does not recognize --{pass_name}") from e
+                f"{pass_name!r} is not a registered pass") from e
         return "PASS_ERROR", str(e).splitlines()[0][:200]
     try:
         res = tv.check_equivalence(src_mod, tgt_mod, timeout=timeout)

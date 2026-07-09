@@ -1388,6 +1388,71 @@ def test_sweep_zero_work_fails():
 
 def test_sweep_unknown_pass_is_fatal():
     from triton.tools import smt_validate_passes as vp
-    with pytest.raises(RuntimeError, match="does not recognize"):
+    with pytest.raises(RuntimeError, match="not a registered pass"):
         vp.validate_pass("tt.func public @k() { tt.return }",
                          "no-such-pass-xyz", tv.default_triton_opt(), 30.0)
+
+
+# Codex milestone-4 review round 3: discovery must not be fooled by tt.func
+# as an attribute name or inside strings, and driver options must not
+# masquerade as passes.
+def test_split_funcs_ttfunc_as_attribute_name():
+    from triton.tools.smt_validate_passes import _split_structured
+    ttir = """module {
+  tt.func public @victim(%o: !tt.ptr<i32>) attributes {tt.func = false} {
+    %z = arith.constant 0 : i32
+    %pid = tt.get_program_id x : i32
+    %p = tt.addptr %o, %pid : !tt.ptr<i32>, i32
+    tt.store %p, %z : !tt.ptr<i32>
+    tt.return
+  }
+  tt.func public @after() {
+    tt.return
+  }
+}
+"""
+    r = _split_structured(ttir)
+    assert len(r.defs) == 2 and not r.errors and not r.decls, \
+        (len(r.defs), len(r.decls), r.errors)
+    assert r.defs[0].startswith("tt.func public @victim")
+    assert "tt.store" in r.defs[0] and r.defs[0].rstrip().endswith("}")
+
+
+def test_split_funcs_ttfunc_in_string_attr():
+    from triton.tools.smt_validate_passes import _split_structured
+    ttir = """module {
+  tt.func public @a() attributes {note = "tt.func @fake() {"} {
+    tt.return
+  }
+  tt.func public @b() {
+    tt.return
+  }
+}
+"""
+    r = _split_structured(ttir)
+    assert len(r.defs) == 2 and not r.errors, (len(r.defs), r.errors)
+
+
+def test_driver_option_is_not_a_pass():
+    from triton.tools import smt_validate_passes as vp
+    for bogus in ("allow-unregistered-dialect", "mlir-print-ir-after-all"):
+        with pytest.raises(RuntimeError, match="not a registered pass"):
+            vp.validate_pass("tt.func public @k() { tt.return }", bogus,
+                             tv.default_triton_opt(), 30.0)
+
+
+def test_split_funcs_nested_modules():
+    from triton.tools.smt_validate_passes import _split_structured
+    # Multi-module lit files parse-normalize into nested modules; discovery
+    # must descend into them rather than skipping them as opaque braces.
+    ttir = """module {
+  module {
+    tt.func public @a() { tt.return }
+  }
+  module attributes {ttg.target = "cuda:80"} {
+    tt.func public @b() { tt.return }
+  }
+}
+"""
+    r = _split_structured(ttir)
+    assert len(r.defs) == 2 and not r.errors, (len(r.defs), r.errors)
