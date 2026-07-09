@@ -8,3 +8,14 @@
 - Run lit from the build dir:  `cd BUILD_DIR; ninja triton-opt; lit -v test/<path>.mlir` (example: `lit -v test/TritonNvidiaGPU/tmem_layouts.mlir`).
 - Lit tests can be run locally (no GPU required).
 - Compiler crashes sometimes print an MLIR reproducer (external_resources / mlir_reproducer). Save the full MLIR + {-# ... #-} metadata to `/tmp/<file>.mlir`, then run `triton-opt /tmp/<file>.mlir --run-reproducer` to reproduce locally.
+
+## SMT translation-validation work (this fork)
+
+For any work on the SMT equivalence checker (`lib/Conversion/TritonToSMT/`,
+`python/triton/tools/smt_equivalence.py`, `scripts/patches/`, `docs/smt-tv/`),
+read `CLAUDE.md` at the repo root FIRST — it is the authoritative project
+instruction file for this fork: environment facts (use `.venv/bin/python`;
+the two LLVM layouts; `TRITON_OPT`/`MLIR_TRANSLATE`/`Z3` overrides), the
+verification entrypoint (`scripts/smt-verify.sh` — do NOT use `make` for this
+work), and the non-negotiable soundness rules. The review brief for
+adversarial soundness reviews is `docs/smt-tv/review-prompt.md`.
