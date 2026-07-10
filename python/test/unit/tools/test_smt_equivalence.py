@@ -392,11 +392,14 @@ def test_reject_fused_arg_reduce():
     assert res.verdict == "UNSUPPORTED", res.verdict
 
 
-def test_reject_multidim_reduce():
-    # Only axis-0, rank-1 reductions are supported in this milestone.
+def test_rank2_reduce_supported_via_memory_model():
+    # The legacy path supports only axis-0 rank-1 reductions; a rank-2 axis-1
+    # reduce is rejected there and routed to the phase-3 block memory model,
+    # which materializes the 2-D lanes and folds along the axis.
     res = tv.check_kernels(red_sum_2d, red_sum_2d, _SR1, src_constexprs=_CX,
                            tgt_constexprs=_CX)
-    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
 
 
 # --- Adversarial regression tests for the soundness review (inline TTIR so the
@@ -464,10 +467,24 @@ _I8_TRUE = _mod("""
   }""")
 
 
-def test_reject_non_identity_addressing():
+def test_non_identity_addressing_not_equivalent():
     # Different values to a shifted address must NOT be reported EQUIVALENT.
+    # The legacy path disproves identity addressing (scope 0 sat), which now
+    # routes to the block memory model; there the shifted store is modeled
+    # per-offset and the differing values are caught by the equivalence scope.
     res = tv.check_equivalence(_SHIFTED_A, _SHIFTED_2A)
-    assert res.verdict == "UNSUPPORTED", (res.verdict, res.addressing_status)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict,
+                                             res.addressing_status)
+    assert res.memory_model, "expected the block-memory-model retry path"
+
+
+def test_non_identity_addressing_equivalent_pair():
+    # The same shifted-store kernel against itself is EQUIVALENT under the
+    # block memory model -- the phase-3 point: non-identity addressing gets a
+    # real verdict instead of UNSUPPORTED.
+    res = tv.check_equivalence(_SHIFTED_A, _SHIFTED_A)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
 
 
 def test_integer_overflow_is_faithful():
@@ -570,9 +587,15 @@ def test_reject_non_void_return():
     assert res.verdict == "UNSUPPORTED", res.verdict
 
 
-def test_reject_inconsistent_lane_count():
+def test_inconsistent_lane_count_routes_to_memory_model():
+    # The legacy writer decomposition cannot attribute lanes when an unrelated
+    # tt.make_range extent disagrees with the store lane count, so it rejects;
+    # the block memory model has no writer decomposition (each lane carries
+    # its own offset), so the dead 128-lane range is materialized harmlessly
+    # and the self-pair is EQUIVALENT.
     res = tv.check_equivalence(_LANE_MISMATCH, _LANE_MISMATCH)
-    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
 
 
 # --- Third-round review regressions (reject; never false EQUIVALENT or crash). ---
@@ -744,9 +767,25 @@ _RAW_EQ = _mod("""
   }""")
 
 
-def test_reject_chained_addptr():
+def test_chained_addptr_wrap_not_equivalent():
+    # The chained kernel's offsets sum to idx + 2^32 in real (64-bit) pointer
+    # arithmetic but would wrap to idx in a 32-bit model. The legacy path
+    # rejects chains outright; the block memory model accumulates each
+    # sign-extended offset in a 64-bit block offset, so the chain lands
+    # 2^32 elements past @src's store and the pair must NOT be EQUIVALENT.
+    # (A false EQUIVALENT here is the exact unsoundness the phase-2 rejection
+    # guarded against.)
     res = tv.check_equivalence(_STORE_I8, _CHAINED_ADDPTR)
-    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
+
+
+def test_chained_addptr_self_equivalent():
+    # The same chained kernel against itself is EQUIVALENT: chains are now
+    # modeled exactly, not rejected.
+    res = tv.check_equivalence(_CHAINED_ADDPTR, _CHAINED_ADDPTR)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
 
 
 def test_reject_reinterpreting_load_through_bitcast():
@@ -840,9 +879,13 @@ def test_reject_unsupported_reduce_combiner():
     assert res.verdict == "UNSUPPORTED", res.verdict
 
 
-def test_reject_masked_load_feeding_reduce():
+def test_masked_load_feeding_reduce_via_memory_model():
+    # The legacy reduction path rejects a masked load feeding a reduce; the
+    # block memory model supports it exactly (masked-out lanes carry `other`
+    # into the fold, matching the semantics of the loaded tensor).
     res = tv.check_equivalence(_RED_MASKED, _RED_MASKED)
-    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
 
 
 # A reduce combiner region that also performs a side-effecting (volatile) load:
@@ -1491,3 +1534,402 @@ def test_pipeline_grammar_is_not_a_pass():
                 "builtin.module()"):
         with pytest.raises(RuntimeError, match="atomic pass name"):
             vp.validate_pass(fn, bad, tv.default_triton_opt(), 30.0)
+
+
+# =============================================================================
+# Phase 3: block memory model (strided / multi-dimensional / masked addressing)
+# =============================================================================
+# These kernels are outside the identity-addressing contract, so every check
+# below exercises the memory-model retry path (asserted via res.memory_model).
+# See docs/smt-tv/phase-3.md.
+
+
+@triton.jit
+def tile2d_mul2(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = om[:, None] * sm + on[None, :] * sn
+    mask = (om[:, None] < M) & (on[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(o_ptr + offs, x * 2.0, mask=mask)
+
+
+@triton.jit
+def tile2d_add2_commuted(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                         BN: tl.constexpr):
+    # Same addressing with the offset addition commuted, and x+x for x*2.
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = on[None, :] * sn + om[:, None] * sm
+    mask = (om[:, None] < M) & (on[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(o_ptr + offs, x + x, mask=mask)
+
+
+@triton.jit
+def tile2d_swapped_strides(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                           BN: tl.constexpr):
+    # Transposed addressing: sm and sn swapped.
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = om[:, None] * sn + on[None, :] * sm
+    mask = (om[:, None] < M) & (on[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(o_ptr + offs, x * 2.0, mask=mask)
+
+
+@triton.jit
+def tile2d_off_by_one(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                      BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = om[:, None] * sm + on[None, :] * sn
+    mask = (om[:, None] < M) & (on[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(o_ptr + offs + 1, x * 2.0, mask=mask)
+
+
+@triton.jit
+def tile2d_mask_le(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                   BN: tl.constexpr):
+    # Wrong bound: <= M instead of < M changes the accessed set.
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = om[:, None] * sm + on[None, :] * sn
+    mask = (om[:, None] <= M) & (on[None, :] < N)
+    x = tl.load(x_ptr + offs, mask=mask, other=0.0)
+    tl.store(o_ptr + offs, x * 2.0, mask=mask)
+
+
+@triton.jit
+def tile2d_unmasked(x_ptr, o_ptr, M, N, sm, sn, BM: tl.constexpr,
+                    BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    offs = om[:, None] * sm + on[None, :] * sn
+    x = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, x * 2.0)
+
+
+_S2D = {"x_ptr": PTR, "o_ptr": PTR, "M": "i32", "N": "i32", "sm": "i32",
+        "sn": "i32", "BM": "constexpr", "BN": "constexpr"}
+_CX2D = {"BM": 4, "BN": 4}
+
+
+def _check2d(src, tgt, **kw):
+    return tv.check_kernels(src, tgt, _S2D, src_constexprs=_CX2D,
+                            tgt_constexprs=_CX2D, **kw)
+
+
+def test_2d_strided_masked_tile_equivalent():
+    # Commuted affine offsets + x*2 vs x+x: same offsets, same values.
+    res = _check2d(tile2d_mul2, tile2d_add2_commuted)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"
+    # Both kernels would be OOB unmasked, but their UB domains coincide.
+    assert res.ub_status == "unsat", res.ub_status
+
+
+def test_2d_swapped_strides_not_equivalent():
+    # A transpose is a different memory function; the access sets differ, so
+    # the UB (OOB) domains already differ.
+    res = _check2d(tile2d_mul2, tile2d_swapped_strides)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+def test_2d_off_by_one_base_not_equivalent():
+    res = _check2d(tile2d_mul2, tile2d_off_by_one)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+def test_2d_wrong_mask_bound_not_equivalent():
+    res = _check2d(tile2d_mul2, tile2d_mask_le)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+def test_2d_unmasked_vs_masked_not_equivalent():
+    # The unmasked tile can access out of bounds where the masked one is
+    # defined: distinct UB domains, hence not mutually refining.
+    res = _check2d(tile2d_unmasked, tile2d_mul2)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.ub_status == "sat", (res.ub_status, res.z3_output)
+    assert res.memory_model
+
+
+def test_2d_masked_tile_self_equivalent():
+    res = _check2d(tile2d_mul2, tile2d_mul2)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+@triton.jit
+def bcast_add_ab(a_ptr, b_ptr, o_ptr, ldc, BM: tl.constexpr,
+                 BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    a = tl.load(a_ptr + om)
+    b = tl.load(b_ptr + on)
+    c = a[:, None] + b[None, :]
+    tl.store(o_ptr + om[:, None] * ldc + on[None, :], c)
+
+
+@triton.jit
+def bcast_add_ba(a_ptr, b_ptr, o_ptr, ldc, BM: tl.constexpr,
+                 BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.program_id(1) * BN + tl.arange(0, BN)
+    a = tl.load(a_ptr + om)
+    b = tl.load(b_ptr + on)
+    c = b[None, :] + a[:, None]
+    tl.store(o_ptr + om[:, None] * ldc + on[None, :], c)
+
+
+def test_broadcast_add_order_invariance():
+    sig = {"a_ptr": PTR, "b_ptr": PTR, "o_ptr": PTR, "ldc": "i32",
+           "BM": "constexpr", "BN": "constexpr"}
+    res = tv.check_kernels(bcast_add_ab, bcast_add_ba, sig,
+                           src_constexprs=_CX2D, tgt_constexprs=_CX2D)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+@triton.jit
+def rowsum2d_axis1(x_ptr, o_ptr, s, BM: tl.constexpr, BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    x = tl.load(x_ptr + om[:, None] * s + on[None, :])
+    tl.store(o_ptr + om, tl.sum(x, axis=1))
+
+
+@triton.jit
+def rowsum2d_axis1_commuted(x_ptr, o_ptr, s, BM: tl.constexpr,
+                            BN: tl.constexpr):
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    x = tl.load(x_ptr + on[None, :] + om[:, None] * s)
+    tl.store(o_ptr + om, tl.sum(x, axis=1))
+
+
+@triton.jit
+def rowsum2d_axis0(x_ptr, o_ptr, s, BM: tl.constexpr, BN: tl.constexpr):
+    # Sums the wrong axis; with BM == BN the store set is identical, so only
+    # the stored VALUES differ.
+    om = tl.program_id(0) * BM + tl.arange(0, BM)
+    on = tl.arange(0, BN)
+    x = tl.load(x_ptr + om[:, None] * s + on[None, :])
+    tl.store(o_ptr + om, tl.sum(x, axis=0))
+
+
+_SROW = {"x_ptr": PTR, "o_ptr": PTR, "s": "i32", "BM": "constexpr",
+         "BN": "constexpr"}
+
+
+def test_rowwise_reduction_over_2d_load_equivalent():
+    res = tv.check_kernels(rowsum2d_axis1, rowsum2d_axis1_commuted, _SROW,
+                           src_constexprs=_CX2D, tgt_constexprs=_CX2D)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+def test_rowsum_wrong_axis_not_equivalent():
+    res = tv.check_kernels(rowsum2d_axis1, rowsum2d_axis0, _SROW,
+                           src_constexprs=_CX2D, tgt_constexprs=_CX2D)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+# --- Intra-store write-write races are UB (scope 1), pinned with inline TTIR
+#     so the exact overlapping-store pattern is exercised. ---
+
+# All four lanes store the (per-lane distinct) loaded values to offset 0: a
+# race whenever two loaded values differ.
+_RACE_STORE = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+    %z = arith.constant dense<0> : tensor<4xi32>
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sx = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %px = tt.addptr %sx, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %px : tensor<4x!tt.ptr<f32>>
+    %so = tt.splat %o : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %po = tt.addptr %so, %z : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    tt.store %po, %v : tensor<4x!tt.ptr<f32>>
+    tt.return
+  }""")
+# Same loads and store set, but every lane stores x-x (all lanes provably
+# equal over ideal reals): race-free.
+_RACE_FREE = _mod("""
+  tt.func public @k(%x: !tt.ptr<f32>, %o: !tt.ptr<f32>) {
+    %z = arith.constant dense<0> : tensor<4xi32>
+    %r = tt.make_range {end = 4 : i32, start = 0 : i32} : tensor<4xi32>
+    %sx = tt.splat %x : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %px = tt.addptr %sx, %r : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    %v = tt.load %px : tensor<4x!tt.ptr<f32>>
+    %d = arith.subf %v, %v : tensor<4xf32>
+    %so = tt.splat %o : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
+    %po = tt.addptr %so, %z : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+    tt.store %po, %d : tensor<4x!tt.ptr<f32>>
+    tt.return
+  }""")
+
+
+def test_racy_store_vs_race_free_not_equivalent():
+    # src races exactly when two loaded lanes differ; tgt never races. The UB
+    # domains differ, so the kernels do not mutually refine.
+    res = tv.check_equivalence(_RACE_STORE, _RACE_FREE)
+    assert res.verdict == "NOT_EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.ub_status == "sat", (res.ub_status, res.z3_output)
+    assert res.memory_model
+
+
+def test_same_race_both_sides_equivalent():
+    # Two kernels that race on exactly the same inputs are EQUIVALENT by the
+    # bidirectional-refinement design (as with identical unbounded shifts).
+    res = tv.check_equivalence(_RACE_STORE, _RACE_STORE)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+# --- Sequential per-program semantics: a load after a store to the same block
+#     sees the stored value. ---
+
+_SEQ_RMW = _mod("""
+  tt.func public @k(%o: !tt.ptr<f32>, %p: !tt.ptr<f32>, %x: f32) {
+    %pid = tt.get_program_id x : i32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %x : !tt.ptr<f32>
+    %y = tt.load %po : !tt.ptr<f32>
+    %pp = tt.addptr %p, %pid : !tt.ptr<f32>, i32
+    tt.store %pp, %y : !tt.ptr<f32>
+    tt.return
+  }""")
+_SEQ_DIRECT = _mod("""
+  tt.func public @k(%o: !tt.ptr<f32>, %p: !tt.ptr<f32>, %x: f32) {
+    %pid = tt.get_program_id x : i32
+    %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
+    tt.store %po, %x : !tt.ptr<f32>
+    %pp = tt.addptr %p, %pid : !tt.ptr<f32>, i32
+    tt.store %pp, %x : !tt.ptr<f32>
+    tt.return
+  }""")
+
+
+def test_load_after_store_sees_stored_value():
+    # Multiple stores are legal under the block model (folded in program
+    # order), and the reload reads the just-stored value, not the initial
+    # memory. The legacy path rejects this (two stores), so it routes to the
+    # memory model.
+    res = tv.check_equivalence(_SEQ_RMW, _SEQ_DIRECT)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+# --- Sound-by-rejection: everything outside the phase-3 contract stays
+#     UNSUPPORTED (never a silent EQUIVALENT). ---
+
+
+@triton.jit
+def gather2d_kernel(x_ptr, i_ptr, o_ptr, B: tl.constexpr):
+    # A 1-D identity-addressed gather is exactly encodable on the legacy
+    # symbolic-lane path (a nested select with no OOB semantics), so to pin
+    # the MEMORY-MODEL rejection the gather must be 2-D.
+    om = tl.program_id(0) * B + tl.arange(0, B)
+    on = tl.arange(0, B)
+    offs = om[:, None] * B + on[None, :]
+    idx = tl.load(i_ptr + offs)
+    v = tl.load(x_ptr + idx)
+    tl.store(o_ptr + offs, v)
+
+
+def test_reject_gather():
+    sig = {"x_ptr": PTR, "i_ptr": "*i32", "o_ptr": PTR, "B": "constexpr"}
+    cx = {"B": 4}
+    res = tv.check_kernels(gather2d_kernel, gather2d_kernel, sig,
+                           src_constexprs=cx, tgt_constexprs=cx)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert "data-dependent addressing" in res.z3_output, res.z3_output
+
+
+@triton.jit
+def dyn_stride_kernel(x_ptr, s_ptr, o_ptr, BLOCK: tl.constexpr):
+    s = tl.load(s_ptr)
+    offs = tl.arange(0, BLOCK) * s
+    v = tl.load(x_ptr + offs)
+    tl.store(o_ptr + offs, v)
+
+
+def test_reject_data_dependent_stride():
+    sig = {"x_ptr": PTR, "s_ptr": "*i32", "o_ptr": PTR, "BLOCK": "constexpr"}
+    cx = {"BLOCK": 4}
+    res = tv.check_kernels(dyn_stride_kernel, dyn_stride_kernel, sig,
+                           src_constexprs=cx, tgt_constexprs=cx)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+@triton.jit
+def rank3_kernel(x_ptr, o_ptr, B: tl.constexpr):
+    a = tl.arange(0, B)
+    t = a[:, None, None] * B * B + a[None, :, None] * B + a[None, None, :]
+    v = tl.load(x_ptr + t)
+    tl.store(o_ptr + t, v)
+
+
+def test_reject_rank3_block():
+    sig = {"x_ptr": PTR, "o_ptr": PTR, "B": "constexpr"}
+    cx = {"B": 2}
+    res = tv.check_kernels(rank3_kernel, rank3_kernel, sig,
+                           src_constexprs=cx, tgt_constexprs=cx)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_reject_oversized_extent_product():
+    # 64x64 = 4096 lanes exceeds the max-lanes tractability threshold; the
+    # block must be rejected loudly regardless of its (supported) rank.
+    res = tv.check_kernels(tile2d_mul2, tile2d_mul2, _S2D,
+                           src_constexprs={"BM": 64, "BN": 64},
+                           tgt_constexprs={"BM": 64, "BN": 64})
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+@triton.jit
+def atomic_kernel(x_ptr, o_ptr, BLOCK: tl.constexpr):
+    offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + offs)
+    tl.atomic_add(o_ptr + offs, v)
+
+
+def test_reject_atomic():
+    sig = {"x_ptr": PTR, "o_ptr": PTR, "BLOCK": "constexpr"}
+    cx = {"BLOCK": 4}
+    res = tv.check_kernels(atomic_kernel, atomic_kernel, sig,
+                           src_constexprs=cx, tgt_constexprs=cx)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+@triton.jit
+def dot_kernel(a_ptr, b_ptr, c_ptr, B: tl.constexpr):
+    r = tl.arange(0, B)
+    offs = r[:, None] * B + r[None, :]
+    a = tl.load(a_ptr + offs)
+    b = tl.load(b_ptr + offs)
+    c = tl.dot(a, b)
+    tl.store(c_ptr + offs, c)
+
+
+def test_reject_dot():
+    sig = {"a_ptr": PTR, "b_ptr": PTR, "c_ptr": PTR, "B": "constexpr"}
+    cx = {"B": 16}
+    res = tv.check_kernels(dot_kernel, dot_kernel, sig, src_constexprs=cx,
+                           tgt_constexprs=cx)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+
+
+def test_block_size_pins_legacy_contract():
+    # An explicit block_size opts out of the memory-model retry: non-identity
+    # addressing stays UNSUPPORTED rather than silently switching contracts.
+    res = tv.check_equivalence(_SHIFTED_A, _SHIFTED_2A, block_size=1)
+    assert res.verdict == "UNSUPPORTED", res.verdict
+    assert not res.memory_model

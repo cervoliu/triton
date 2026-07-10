@@ -26,6 +26,17 @@
 // output arrays can differ on an input where neither function is UB (unsat =>
 // equivalent as bidirectional refinement). See Passes.td.
 //
+// With the `memory-model` option (phase 3), the identity-addressing contract
+// is replaced by a block memory model absorbed from mlir-tv: every pointer
+// argument is a distinct block (SMT array + symbolic element count), tensors
+// are materialized as concrete lanes with a static shape (rank <= 2, extent
+// product bounded by `max-lanes`), and loads/stores consume per-lane symbolic
+// offsets. Out-of-bounds active accesses, poison reaching memory, and two
+// active lanes of one store writing different values to the same offset (an
+// intra-store race) fold into the UB predicate. The same three scopes are
+// emitted; scope 0 becomes a documented always-unsat placeholder (block
+// decomposition is total by construction). See docs/smt-tv/phase-3.md.
+//
 //===----------------------------------------------------------------------===//
 
 #include "triton/Conversion/TritonToSMT/Passes.h"
@@ -39,6 +50,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/TypeSwitch.h"
@@ -57,6 +69,13 @@ namespace {
 // Width of the address/index domain. Triton elementwise kernels index with i32;
 // kernels using a different index width are rejected.
 static constexpr unsigned kAddrWidth = 32;
+
+// Width of the memory-model block offset domain. Real Triton pointer
+// arithmetic sign-extends each i32 offset and accumulates in 64-bit address
+// space, so chained tt.addptr sums must NOT be modeled modulo 2^32 (two
+// chained offsets of 2^31 reach base + 2^32, not base + 0). Every block
+// offset in memory-model mode is a bv64.
+static constexpr unsigned kPtrWidth = 64;
 
 //===----------------------------------------------------------------------===//
 // Helpers
@@ -155,8 +174,22 @@ struct EncodedValue {
   // Per-lane poison predicates; parallel to `lanes` when non-empty. An empty
   // vector with non-empty `lanes` means no lane is ever poison.
   SmallVector<Value> lanePoison;
+  // --- Phase-3 memory-model fields (inert defaults on the legacy paths). ---
+  // Static tensor shape, row-major lane order; empty means scalar. A shaped
+  // value with empty `lanes` is a splat: every lane reads `value` (or, for a
+  // pointer, `offset`), which the laneVal/laneOff broadcasting already does.
+  SmallVector<int64_t> shape;
+  // Pointer: the block's symbolic element count (memory-model mode). An
+  // active access at offset >=u size is UB.
+  Value size;
+  // True iff this value derives from loaded memory. tt.addptr offsets must be
+  // memory-independent (gather/scatter and loaded strides are rejected);
+  // masks and stored values may be memory-dependent (their encoding stays
+  // exact, since the initial memory contents are themselves shared inputs).
+  bool mem = false;
   bool isPtr() const { return array != nullptr; }
   bool isVector() const { return !lanes.empty(); }
+  bool isShaped() const { return !shape.empty(); }
   // Value at lane k, broadcasting a scalar operand.
   Value laneVal(unsigned k) const { return isVector() ? lanes[k] : value; }
   Value laneOff(unsigned k) const { return isVector() ? lanes[k] : offset; }
@@ -203,110 +236,139 @@ struct StoreInfo {
   Value mask;   // predicate (null => always)
 };
 
-//===----------------------------------------------------------------------===//
-// Pass
-//===----------------------------------------------------------------------===//
-
-struct ConvertTritonToSMT
-    : public mlir::triton::impl::ConvertTritonToSMTBase<ConvertTritonToSMT> {
-  using ConvertTritonToSMTBase::ConvertTritonToSMTBase;
-
-  void runOnOperation() override;
-
-  // Declare the shared symbolic inputs for one signature at the current
-  // insertion point. Returns false (and emits an error) on an unsupported type.
-  bool declareInputs(OpBuilder &b, Location loc, ArrayRef<Type> argTypes,
-                     Value &outIndex, SmallVectorImpl<EncodedValue> &outArgs);
-
-  // Encode `func` at the symbolic index `iVal` using `sharedArgs`. Appends the
-  // function's stores to `stores` and sets `outUB` to the function's UB
-  // predicate: a Bool that is true exactly on inputs where poison (tracked
-  // per value, e.g. from an oversized shift) reaches a memory operation.
-  // Null means the function is UB-free on all inputs. Returns false (and
-  // emits an error) if the function uses an unsupported construct.
-  bool encodeFunction(OpBuilder &b, triton::FuncOp func,
-                      ArrayRef<EncodedValue> sharedArgs, Value iVal,
-                      SmallVectorImpl<StoreInfo> &stores, Value &outUB);
-};
-
-bool ConvertTritonToSMT::declareInputs(OpBuilder &b, Location loc,
-                                       ArrayRef<Type> argTypes, Value &outIndex,
-                                       SmallVectorImpl<EncodedValue> &outArgs) {
-  MLIRContext *ctx = &getContext();
-  auto addrTy = smt::BitVectorType::get(ctx, kAddrWidth);
-
-  outIndex = smt::DeclareFunOp::create(b, loc, addrTy, b.getStringAttr("i"))
-                 .getResult();
-  Value zeroOff =
-      smt::BVConstantOp::create(b, loc, APInt(kAddrWidth, 0)).getResult();
-
-  for (auto [idx, argTy] : llvm::enumerate(argTypes)) {
-    std::string name = ("arg" + Twine(idx)).str();
-    if (auto ptrTy = dyn_cast<triton::PointerType>(argTy)) {
-      Type range = smtSortFor(ptrTy.getPointeeType(), ctx);
-      if (!range) {
-        getOperation().emitError("TritonToSMT: unsupported pointee type ")
-            << ptrTy.getPointeeType();
-        return false;
-      }
-      auto arrTy = smt::ArrayType::get(ctx, addrTy, range);
-      Value arr =
-          smt::DeclareFunOp::create(b, loc, arrTy, b.getStringAttr(name))
-              .getResult();
-      outArgs.push_back(EncodedValue::ptr(arr, zeroOff, /*fresh=*/true));
-    } else if (Type sort = smtSortFor(argTy, ctx)) {
-      Value v = smt::DeclareFunOp::create(b, loc, sort, b.getStringAttr(name))
-                    .getResult();
-      outArgs.push_back(EncodedValue::plain(v));
-    } else {
-      getOperation().emitError("TritonToSMT: unsupported argument type ")
-          << argTy;
-      return false;
-    }
-  }
-  return true;
+// Validate a pointer-to-pointer bitcast's pointee reinterpretation. Only
+// integer<->integer reinterpretations that keep the addressing granularity
+// (byte size) are sound in this value-based model: float bitcasts reinterpret
+// bits (e.g. f16 vs bf16 map to the same real yet differ in memory) and size
+// changes alter the element stride. The i1<->i8 byte-backed-bool idiom is
+// preserved. Returns an error message, or nullptr when the bitcast is modeled.
+static const char *checkPtrBitcastPointees(Type se, Type de) {
+  auto intBytes = [](Type t) -> int {
+    auto it = dyn_cast<IntegerType>(t);
+    return it ? int((it.getWidth() + 7) / 8) : -1;
+  };
+  if (se != de && (intBytes(se) < 0 || intBytes(de) < 0 ||
+                   intBytes(se) != intBytes(de)))
+    return "unsupported pointer bitcast: only a same-byte-size integer "
+           "pointee reinterpretation is modeled";
+  return nullptr;
 }
 
-bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
-                                        ArrayRef<EncodedValue> sharedArgs,
-                                        Value iVal,
-                                        SmallVectorImpl<StoreInfo> &stores,
-                                        Value &outUB) {
-  MLIRContext *ctx = &getContext();
-  Location loc = func.getLoc();
-  auto R = smt::RealType::get(ctx);
-  auto Bool = smt::BoolType::get(ctx);
+// True iff the two bit-vector terms are structurally guaranteed to differ on
+// every input: distinct constants, or `base + c1` vs `base + c2` with the
+// same base term and distinct constant addends (bvadd wraps, so c1 != c2
+// implies the sums differ for every base). Used ONLY to elide intra-store
+// race terms that can never fire; returning false is always sound (the term
+// is emitted and the solver decides).
+static bool provablyDistinctBV(Value a, Value b) {
+  auto constOf = [](Value v) -> std::optional<APInt> {
+    if (auto c = v.getDefiningOp<smt::BVConstantOp>())
+      return c.getValue().getValue();
+    return std::nullopt;
+  };
+  if (a == b)
+    return false;
+  auto ca = constOf(a), cb = constOf(b);
+  if (ca && cb)
+    return *ca != *cb;
+  auto aa = a.getDefiningOp<smt::BVAddOp>();
+  auto ba = b.getDefiningOp<smt::BVAddOp>();
+  if (aa && ba) {
+    if (aa.getLhs() == ba.getLhs()) {
+      auto x = constOf(aa.getRhs()), y = constOf(ba.getRhs());
+      if (x && y)
+        return *x != *y;
+    }
+    if (aa.getRhs() == ba.getRhs()) {
+      auto x = constOf(aa.getLhs()), y = constOf(ba.getLhs());
+      if (x && y)
+        return *x != *y;
+    }
+  }
+  return false;
+}
 
-  // Bit-vector / real / bool builder helpers.
-  auto bvc = [&](const APInt &v) {
+//===----------------------------------------------------------------------===//
+// Shared SMT term builders and the elementwise-op encoder
+//===----------------------------------------------------------------------===//
+
+// Builder facade shared by the legacy (symbolic-lane), reduction (1-D lane),
+// and memory-model (N-D lane) encoders. Pure elementwise op semantics live in
+// encodeElementwise() and NOWHERE else.
+struct SMTBuilder {
+  OpBuilder &b;
+  Location loc;
+  smt::RealType R;
+  smt::BoolType Bool;
+
+  SMTBuilder(OpBuilder &b, Location loc, MLIRContext *ctx)
+      : b(b), loc(loc), R(smt::RealType::get(ctx)),
+        Bool(smt::BoolType::get(ctx)) {}
+
+  Value bvc(const APInt &v) {
     return smt::BVConstantOp::create(b, loc, v).getResult();
-  };
-  auto addrConst = [&](uint64_t v) { return bvc(APInt(kAddrWidth, v)); };
-  auto bvcmp = [&](smt::BVCmpPredicate p, Value x, Value y) {
+  }
+  Value addrConst(uint64_t v) { return bvc(APInt(kAddrWidth, v)); }
+  Value ptrConst(uint64_t v) { return bvc(APInt(kPtrWidth, v)); }
+  // Sign-extend a bv32 offset into the 64-bit block address space, matching
+  // tt.addptr's real pointer-arithmetic semantics.
+  Value sextToPtr(Value x32) {
+    Value isNeg = bvcmp(smt::BVCmpPredicate::slt, x32,
+                        bvc(APInt(kAddrWidth, 0)));
+    Value hi = ite(isNeg, bvc(APInt::getAllOnes(kPtrWidth - kAddrWidth)),
+                   bvc(APInt(kPtrWidth - kAddrWidth, 0)));
+    return smt::ConcatOp::create(b, loc, hi, x32).getResult();
+  }
+  Value bvcmp(smt::BVCmpPredicate p, Value x, Value y) {
     return smt::BVCmpOp::create(b, loc, p, x, y).getResult();
-  };
-  auto sel = [&](Value arr, Value idx, Type range) {
+  }
+  Value sel(Value arr, Value idx, Type range) {
     return smt::ArraySelectOp::create(b, loc, range, arr, idx).getResult();
-  };
-  auto ite = [&](Value c, Value t, Value e) {
+  }
+  Value ite(Value c, Value t, Value e) {
     return smt::IteOp::create(b, loc, t.getType(), c, t, e).getResult();
-  };
-  auto beq = [&](Value x, Value y) {
+  }
+  Value beq(Value x, Value y) {
     return smt::EqOp::create(b, loc, x, y).getResult();
-  };
-  auto bnot = [&](Value x) { return smt::NotOp::create(b, loc, x).getResult(); };
-  auto band = [&](Value x, Value y) {
+  }
+  Value bnot(Value x) { return smt::NotOp::create(b, loc, x).getResult(); }
+  Value band(Value x, Value y) {
     return smt::AndOp::create(b, loc, x, y).getResult();
-  };
-  auto realBin = [&](Value x, Value y, bool mul) -> Value {
+  }
+  Value bor(Value x, Value y) {
+    return smt::OrOp::create(b, loc, x, y).getResult();
+  }
+  Value boolConst(bool v) {
+    return smt::BoolConstantOp::create(b, loc, Bool, b.getBoolAttr(v))
+        .getResult();
+  }
+  Value realBin(Value x, Value y, bool mul) {
     if (mul)
       return smt::RealMulOp::create(b, loc, R, ValueRange{x, y}).getResult();
     return smt::RealAddOp::create(b, loc, R, ValueRange{x, y}).getResult();
-  };
-  auto realConst = [&](StringRef s) {
+  }
+  Value realConst(StringRef s) {
     return smt::RealConstantOp::create(b, loc, R, b.getStringAttr(s))
         .getResult();
-  };
+  }
+  Value rcmp(smt::IntPredicate p, Value x, Value y) {
+    return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
+  }
+  // Poison algebra over optional Bool predicates (null == provably-false).
+  // Propagation must stay EXACT (see EncodedValue::poison): every rule in
+  // encodeElementwise matches the arith/LLVM poison semantics of the op.
+  Value orPoison(Value a, Value c) {
+    if (!a)
+      return c;
+    if (!c)
+      return a;
+    return bor(a, c);
+  }
+  Value andCond(Value cond, Value p) { // cond ∧ p, null-aware p
+    if (!p)
+      return nullptr;
+    return band(cond, p);
+  }
   // Reconcile a stored value with the buffer's declared SMT sort at a store
   // through a pointer bitcast. Only the bit-vector -> Bool direction (the
   // frontend's extui+bitcast idiom writing a byte into an i1-declared buffer,
@@ -316,164 +378,79 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
   // i1 to 0xff; "store true as 0x01" would prove a kernel equivalent to one
   // storing literal 1, which real memory distinguishes). Returns null for
   // any other sort mismatch, which the caller rejects.
-  auto coerce = [&](Value v, Type sort) -> Value {
+  Value coerce(Value v, Type sort) {
     if (v.getType() == sort)
       return v;
     if (auto bvTy = dyn_cast<smt::BitVectorType>(v.getType()))
       if (isa<smt::BoolType>(sort))
         return bnot(beq(v, bvc(APInt(bvTy.getWidth(), 0))));
     return nullptr;
-  };
-  auto elemOf = [](Type t) -> Type {
+  }
+  static Type elemOf(Type t) {
     if (auto rt = dyn_cast<RankedTensorType>(t))
       return rt.getElementType();
     return t;
-  };
-
-  // Poison algebra over optional Bool predicates (null == provably-false).
-  // Propagation must stay EXACT (see EncodedValue::poison): every rule below
-  // matches the arith/LLVM poison semantics of the op it encodes.
-  auto orPoison = [&](Value a, Value c) -> Value {
-    if (!a)
-      return c;
-    if (!c)
-      return a;
-    return smt::OrOp::create(b, loc, a, c).getResult();
-  };
-  auto andCond = [&](Value cond, Value p) -> Value { // cond ∧ p, null-aware p
-    if (!p)
-      return nullptr;
-    return band(cond, p);
-  };
-  // UB conditions accumulated as poison reaches memory operations.
-  SmallVector<Value> ubConds;
-
-  // Reject external declarations (empty body) and multi-block functions before
-  // touching the entry block.
-  if (!func.getBody().hasOneBlock()) {
-    func.emitError("TritonToSMT: only single-block function bodies are "
-                   "supported (external or multi-block functions rejected)");
-    return false;
   }
-  Block &entry = func.getBody().front();
 
-  // The lane count (block size) is the number of elements the store writes; we
-  // derive it from the store's value shape rather than from a tt.make_range,
-  // which may be unrelated to (or inconsistent with) the store.
-  int64_t block = 1;
-  triton::StoreOp storeOp;
-  for (Operation &op : entry)
-    if (auto st = dyn_cast<triton::StoreOp>(op))
-      storeOp = st;
-  if (storeOp)
-    if (auto vt = dyn_cast<RankedTensorType>(storeOp.getValue().getType())) {
-      if (!vt.hasStaticShape()) {
-        storeOp.emitError("TritonToSMT: dynamic-shaped store is not supported");
-        return false;
+  // Encode an arith.constant (scalar or splat dense) as one SMT value.
+  // Returns null with `why` set for unsupported constants.
+  Value encodeConstant(arith::ConstantOp o, std::string &why) {
+    Attribute a = o.getValue();
+    if (auto fa = dyn_cast<FloatAttr>(a)) {
+      auto s = formatReal(fa.getValue());
+      if (!s) {
+        why = "unsupported float constant (non-finite or exceeds f64 "
+              "precision)";
+        return Value();
       }
-      std::optional<int64_t> ne = ShapedType::tryGetNumElements(vt.getShape());
-      if (!ne) {
-        storeOp.emitError(
-            "TritonToSMT: store element count overflows int64 and is not "
-            "supported");
-        return false;
-      }
-      block = *ne;
+      return realConst(*s);
     }
-  if (blockSize > 0 && blockSize != block) {
-    func.emitError("TritonToSMT: block-size option (")
-        << blockSize << ") disagrees with the store lane count (" << block
-        << ")";
-    return false;
-  }
-
-  // Reduction mode: a tt.reduce collapses a block axis, so its input must be
-  // materialized as N per-lane terms rather than the single symbolic-lane term
-  // the elementwise path uses. Because floats are ideal reals, folding the N
-  // lanes in any order is provably equivalent -- no permutation/multiset
-  // machinery (as mlir-tv needs) is required. Detect it and derive the reduced
-  // extent N. See docs/smt-tv/phase-2.md.
-  bool reductionMode = false;
-  int64_t reducedN = 0;
-  for (Operation &op : entry)
-    if (auto red = dyn_cast<triton::ReduceOp>(op)) {
-      if (red->getNumOperands() != 1 || red->getNumResults() != 1) {
-        red.emitError("TritonToSMT: only single-input/single-result tt.reduce "
-                      "is supported (fused arg-reduce is rejected)");
-        return false;
-      }
-      auto srcTy = dyn_cast<RankedTensorType>(red->getOperand(0).getType());
-      if (red.getAxis() != 0 || !srcTy || srcTy.getRank() != 1 ||
-          !srcTy.hasStaticShape()) {
-        red.emitError("TritonToSMT: only axis-0 reduction of a static rank-1 "
-                      "tensor is supported");
-        return false;
-      }
-      int64_t n = srcTy.getShape()[0];
-      if (reductionMode && n != reducedN) {
-        red.emitError("TritonToSMT: all reductions in a function must share a "
-                      "single reduced extent");
-        return false;
-      }
-      reductionMode = true;
-      reducedN = n;
+    if (auto ia = dyn_cast<IntegerAttr>(a)) {
+      if (ia.getType().getIntOrFloatBitWidth() == 1)
+        return boolConst(ia.getValue() != 0);
+      return bvc(ia.getValue());
     }
-  // A reduce collapses to a scalar-per-program store, so the store lane count
-  // must be 1; a tensor store coexisting with a reduce is not modeled.
-  if (reductionMode && block != 1) {
-    func.emitError("TritonToSMT: a tensor store coexisting with a reduction is "
-                   "not supported (expected a scalar store)");
-    return false;
-  }
-
-  // Every tt.make_range must span exactly the reduced extent (reduction mode)
-  // or the store's lane count (elementwise mode); otherwise the writer/lane
-  // decomposition would misattribute lanes.
-  int64_t rangeExtent = reductionMode ? reducedN : block;
-  for (Operation &op : entry)
-    if (auto range = dyn_cast<triton::MakeRangeOp>(op)) {
-      int64_t ext = int64_t(range.getEnd()) - int64_t(range.getStart());
-      if (ext != rangeExtent) {
-        range.emitError("TritonToSMT: tt.make_range extent (")
-            << ext << ") does not match the expected extent (" << rangeExtent
-            << ")";
-        return false;
+    if (auto dea = dyn_cast<DenseElementsAttr>(a)) {
+      if (!dea.isSplat()) {
+        why = "non-splat dense constant is unsupported";
+        return Value();
       }
+      Type et = dea.getElementType();
+      if (isa<FloatType>(et)) {
+        auto s = formatReal(dea.getSplatValue<APFloat>());
+        if (!s) {
+          why = "unsupported float constant (non-finite or exceeds f64 "
+                "precision)";
+          return Value();
+        }
+        return realConst(*s);
+      }
+      if (auto it = dyn_cast<IntegerType>(et)) {
+        if (it.getWidth() == 1)
+          return boolConst(!dea.getSplatValue<APInt>().isZero());
+        return bvc(dea.getSplatValue<APInt>());
+      }
+      why = "unsupported constant element type";
+      return Value();
     }
-
-  // Writer decomposition for output index i: pid = i / block, lane = i % block.
-  Value pid = iVal, lane = addrConst(0);
-  if (block != 1) {
-    Value blk = addrConst(block);
-    pid = smt::BVUDivOp::create(b, loc, iVal, blk).getResult();
-    lane = smt::BVURemOp::create(b, loc, iVal, blk).getResult();
+    why = "unsupported constant";
+    return Value();
   }
-
-  DenseMap<Value, EncodedValue> env;
-  for (auto [arg, shared] : llvm::zip(entry.getArguments(), sharedArgs))
-    env[arg] = shared;
-  auto V = [&](Value v) { return env[v].value; };
-
-  auto err = [&](Operation *op, const Twine &what) {
-    op->emitError("TritonToSMT: ") << what;
-    return false;
-  };
-
-  auto rcmp = [&](smt::IntPredicate p, Value x, Value y) {
-    return smt::RealCmpOp::create(b, loc, Bool, p, x, y).getResult();
-  };
 
   // The single source of truth for pure elementwise op semantics, shared by
-  // the scalar path, the per-lane (reduction) path, and the reduce combiner.
-  // Operands are fetched through `A` (value) and `P` (poison predicate),
-  // which read the plain value in scalar context and the lane value
-  // (broadcasting scalars) in vector context. On success sets `outPoison` to
-  // the result's exact poison predicate (null == never). A null result with a
-  // non-empty `why` is a rejection (unsupported flag/operand sort); a null
-  // result with an empty `why` means `op` is not a pure elementwise op.
-  auto encodeElementwise = [&](Operation *op, llvm::function_ref<Value(Value)> A,
-                               llvm::function_ref<Value(Value)> P,
-                               Value &outPoison, std::string &why) -> Value {
+  // the scalar path, the per-lane (reduction and memory-model) paths, and the
+  // reduce combiner. Operands are fetched through `A` (value) and `P` (poison
+  // predicate), which read the plain value in scalar context and the lane
+  // value (broadcasting scalars) in vector context; `isPtrVal` reports
+  // whether an operand is an encoded pointer (for the select rejection). On
+  // success sets `outPoison` to the result's exact poison predicate (null ==
+  // never). A null result with a non-empty `why` is a rejection (unsupported
+  // flag/operand sort); a null result with an empty `why` means `op` is not a
+  // pure elementwise op.
+  Value encodeElementwise(Operation *op, llvm::function_ref<Value(Value)> A,
+                          llvm::function_ref<Value(Value)> P,
+                          llvm::function_ref<bool(Value)> isPtrVal,
+                          Value &outPoison, std::string &why) {
     // Default: any-operand-poison, which is the exact arith rule for every
     // op below except select (overridden in its case).
     outPoison = nullptr;
@@ -567,7 +544,7 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
         .Case<arith::OrIOp>([&](arith::OrIOp o) -> Value {
           Value x = A(o.getLhs()), y = A(o.getRhs());
           if (isa<smt::BoolType>(x.getType()))
-            return smt::OrOp::create(b, loc, x, y).getResult();
+            return bor(x, y);
           return smt::BVOrOp::create(b, loc, x, y).getResult();
         })
         .Case<arith::XOrIOp>([&](arith::XOrIOp o) -> Value {
@@ -698,10 +675,6 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           // A pointer-valued select has no plain/lane SMT value to fetch;
           // reject it (the writer model expects one statically-known output
           // array).
-          auto isPtrVal = [&](Value v) {
-            auto it = env.find(v);
-            return it != env.end() && it->second.isPtr();
-          };
           if (isPtrVal(o.getTrueValue()) || isPtrVal(o.getFalseValue())) {
             why = "pointer-valued select is not supported";
             return Value();
@@ -714,10 +687,7 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
           Value chosen = nullptr;
           if (pt || pf) {
             auto orFalse = [&](Value p) -> Value {
-              return p ? p
-                       : smt::BoolConstantOp::create(b, loc, Bool,
-                                                     b.getBoolAttr(false))
-                             .getResult();
+              return p ? p : boolConst(false);
             };
             chosen = ite(A(o.getCondition()), orFalse(pt), orFalse(pf));
           }
@@ -726,6 +696,230 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                      A(o.getFalseValue()));
         })
         .Default([&](Operation *) { return Value(); });
+  }
+};
+
+//===----------------------------------------------------------------------===//
+// Pass
+//===----------------------------------------------------------------------===//
+
+struct ConvertTritonToSMT
+    : public mlir::triton::impl::ConvertTritonToSMTBase<ConvertTritonToSMT> {
+  using ConvertTritonToSMTBase::ConvertTritonToSMTBase;
+
+  void runOnOperation() override;
+
+  // Declare the shared symbolic inputs for one signature at the current
+  // insertion point. Returns false (and emits an error) on an unsupported type.
+  bool declareInputs(OpBuilder &b, Location loc, ArrayRef<Type> argTypes,
+                     Value &outIndex, SmallVectorImpl<EncodedValue> &outArgs);
+
+  // Encode `func` at the symbolic index `iVal` using `sharedArgs`. Appends the
+  // function's stores to `stores` and sets `outUB` to the function's UB
+  // predicate: a Bool that is true exactly on inputs where poison (tracked
+  // per value, e.g. from an oversized shift) reaches a memory operation.
+  // Null means the function is UB-free on all inputs. Returns false (and
+  // emits an error) if the function uses an unsupported construct.
+  bool encodeFunction(OpBuilder &b, triton::FuncOp func,
+                      ArrayRef<EncodedValue> sharedArgs, Value iVal,
+                      SmallVectorImpl<StoreInfo> &stores, Value &outUB);
+
+  // Memory-model (phase 3) encoder: encode `func` over concrete lanes with
+  // per-lane symbolic offsets into per-pointer-arg blocks. `pids` are the
+  // three shared program-id symbols; `memFinal` maps each written block's
+  // initial array symbol to its final contents (sequential store folding);
+  // `outUB` collects poison-reaches-memory, OOB-active-access, and
+  // intra-store race conditions. Returns false (emitting an error) for
+  // anything outside the validated contract.
+  bool encodeFunctionMM(OpBuilder &b, triton::FuncOp func,
+                        ArrayRef<EncodedValue> sharedArgs,
+                        ArrayRef<Value> pids,
+                        llvm::MapVector<Value, Value> &memFinal, Value &outUB);
+};
+
+bool ConvertTritonToSMT::declareInputs(OpBuilder &b, Location loc,
+                                       ArrayRef<Type> argTypes, Value &outIndex,
+                                       SmallVectorImpl<EncodedValue> &outArgs) {
+  MLIRContext *ctx = &getContext();
+  auto addrTy = smt::BitVectorType::get(ctx, kAddrWidth);
+
+  outIndex = smt::DeclareFunOp::create(b, loc, addrTy, b.getStringAttr("i"))
+                 .getResult();
+  Value zeroOff =
+      smt::BVConstantOp::create(b, loc, APInt(kAddrWidth, 0)).getResult();
+
+  for (auto [idx, argTy] : llvm::enumerate(argTypes)) {
+    std::string name = ("arg" + Twine(idx)).str();
+    if (auto ptrTy = dyn_cast<triton::PointerType>(argTy)) {
+      Type range = smtSortFor(ptrTy.getPointeeType(), ctx);
+      if (!range) {
+        getOperation().emitError("TritonToSMT: unsupported pointee type ")
+            << ptrTy.getPointeeType();
+        return false;
+      }
+      auto arrTy = smt::ArrayType::get(ctx, addrTy, range);
+      Value arr =
+          smt::DeclareFunOp::create(b, loc, arrTy, b.getStringAttr(name))
+              .getResult();
+      outArgs.push_back(EncodedValue::ptr(arr, zeroOff, /*fresh=*/true));
+    } else if (Type sort = smtSortFor(argTy, ctx)) {
+      Value v = smt::DeclareFunOp::create(b, loc, sort, b.getStringAttr(name))
+                    .getResult();
+      outArgs.push_back(EncodedValue::plain(v));
+    } else {
+      getOperation().emitError("TritonToSMT: unsupported argument type ")
+          << argTy;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
+                                        ArrayRef<EncodedValue> sharedArgs,
+                                        Value iVal,
+                                        SmallVectorImpl<StoreInfo> &stores,
+                                        Value &outUB) {
+  MLIRContext *ctx = &getContext();
+  Location loc = func.getLoc();
+  SMTBuilder sb(b, loc, ctx);
+
+  // Builder aliases (shared implementations live in SMTBuilder; the poison
+  // algebra and the coerce rule are documented there).
+  auto bvc = [&](const APInt &v) { return sb.bvc(v); };
+  auto addrConst = [&](uint64_t v) { return sb.addrConst(v); };
+  auto sel = [&](Value arr, Value idx, Type range) {
+    return sb.sel(arr, idx, range);
+  };
+  auto ite = [&](Value c, Value t, Value e) { return sb.ite(c, t, e); };
+  auto elemOf = [](Type t) { return SMTBuilder::elemOf(t); };
+  auto orPoison = [&](Value a, Value c) { return sb.orPoison(a, c); };
+  auto andCond = [&](Value cond, Value p) { return sb.andCond(cond, p); };
+  // UB conditions accumulated as poison reaches memory operations.
+  SmallVector<Value> ubConds;
+
+  // Reject external declarations (empty body) and multi-block functions before
+  // touching the entry block.
+  if (!func.getBody().hasOneBlock()) {
+    func.emitError("TritonToSMT: only single-block function bodies are "
+                   "supported (external or multi-block functions rejected)");
+    return false;
+  }
+  Block &entry = func.getBody().front();
+
+  // The lane count (block size) is the number of elements the store writes; we
+  // derive it from the store's value shape rather than from a tt.make_range,
+  // which may be unrelated to (or inconsistent with) the store.
+  int64_t block = 1;
+  triton::StoreOp storeOp;
+  for (Operation &op : entry)
+    if (auto st = dyn_cast<triton::StoreOp>(op))
+      storeOp = st;
+  if (storeOp)
+    if (auto vt = dyn_cast<RankedTensorType>(storeOp.getValue().getType())) {
+      if (!vt.hasStaticShape()) {
+        storeOp.emitError("TritonToSMT: dynamic-shaped store is not supported");
+        return false;
+      }
+      std::optional<int64_t> ne = ShapedType::tryGetNumElements(vt.getShape());
+      if (!ne) {
+        storeOp.emitError(
+            "TritonToSMT: store element count overflows int64 and is not "
+            "supported");
+        return false;
+      }
+      block = *ne;
+    }
+  if (blockSize > 0 && blockSize != block) {
+    func.emitError("TritonToSMT: block-size option (")
+        << blockSize << ") disagrees with the store lane count (" << block
+        << ")";
+    return false;
+  }
+
+  // Reduction mode: a tt.reduce collapses a block axis, so its input must be
+  // materialized as N per-lane terms rather than the single symbolic-lane term
+  // the elementwise path uses. Because floats are ideal reals, folding the N
+  // lanes in any order is provably equivalent -- no permutation/multiset
+  // machinery (as mlir-tv needs) is required. Detect it and derive the reduced
+  // extent N. See docs/smt-tv/phase-2.md.
+  bool reductionMode = false;
+  int64_t reducedN = 0;
+  for (Operation &op : entry)
+    if (auto red = dyn_cast<triton::ReduceOp>(op)) {
+      if (red->getNumOperands() != 1 || red->getNumResults() != 1) {
+        red.emitError("TritonToSMT: only single-input/single-result tt.reduce "
+                      "is supported (fused arg-reduce is rejected)");
+        return false;
+      }
+      auto srcTy = dyn_cast<RankedTensorType>(red->getOperand(0).getType());
+      if (red.getAxis() != 0 || !srcTy || srcTy.getRank() != 1 ||
+          !srcTy.hasStaticShape()) {
+        red.emitError("TritonToSMT: only axis-0 reduction of a static rank-1 "
+                      "tensor is supported");
+        return false;
+      }
+      int64_t n = srcTy.getShape()[0];
+      if (reductionMode && n != reducedN) {
+        red.emitError("TritonToSMT: all reductions in a function must share a "
+                      "single reduced extent");
+        return false;
+      }
+      reductionMode = true;
+      reducedN = n;
+    }
+  // A reduce collapses to a scalar-per-program store, so the store lane count
+  // must be 1; a tensor store coexisting with a reduce is not modeled.
+  if (reductionMode && block != 1) {
+    func.emitError("TritonToSMT: a tensor store coexisting with a reduction is "
+                   "not supported (expected a scalar store)");
+    return false;
+  }
+
+  // Every tt.make_range must span exactly the reduced extent (reduction mode)
+  // or the store's lane count (elementwise mode); otherwise the writer/lane
+  // decomposition would misattribute lanes.
+  int64_t rangeExtent = reductionMode ? reducedN : block;
+  for (Operation &op : entry)
+    if (auto range = dyn_cast<triton::MakeRangeOp>(op)) {
+      int64_t ext = int64_t(range.getEnd()) - int64_t(range.getStart());
+      if (ext != rangeExtent) {
+        range.emitError("TritonToSMT: tt.make_range extent (")
+            << ext << ") does not match the expected extent (" << rangeExtent
+            << ")";
+        return false;
+      }
+    }
+
+  // Writer decomposition for output index i: pid = i / block, lane = i % block.
+  Value pid = iVal, lane = addrConst(0);
+  if (block != 1) {
+    Value blk = addrConst(block);
+    pid = smt::BVUDivOp::create(b, loc, iVal, blk).getResult();
+    lane = smt::BVURemOp::create(b, loc, iVal, blk).getResult();
+  }
+
+  DenseMap<Value, EncodedValue> env;
+  for (auto [arg, shared] : llvm::zip(entry.getArguments(), sharedArgs))
+    env[arg] = shared;
+  auto V = [&](Value v) { return env[v].value; };
+
+  auto err = [&](Operation *op, const Twine &what) {
+    op->emitError("TritonToSMT: ") << what;
+    return false;
+  };
+
+  // Pure elementwise op semantics come from the shared encoder
+  // (SMTBuilder::encodeElementwise -- the single source of truth); this
+  // wrapper binds the pointer-operand check to this function's env.
+  auto isPtrValFn = [&](Value v) {
+    auto it = env.find(v);
+    return it != env.end() && it->second.isPtr();
+  };
+  auto encodeElementwise = [&](Operation *op, llvm::function_ref<Value(Value)> A,
+                               llvm::function_ref<Value(Value)> P,
+                               Value &outPoison, std::string &why) -> Value {
+    return sb.encodeElementwise(op, A, P, isPtrValFn, outPoison, why);
   };
 
   // Reduction (vector) mode: encode one elementwise op at lane `k`,
@@ -1002,49 +1196,11 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               return true;
             })
             .Case<arith::ConstantOp>([&](arith::ConstantOp o) {
-              Attribute a = o.getValue();
-              if (auto fa = dyn_cast<FloatAttr>(a)) {
-                auto s = formatReal(fa.getValue());
-                if (!s)
-                  return err(o, "unsupported float constant (non-finite or "
-                                "exceeds f64 precision)");
-                env[o.getResult()] = EncodedValue::plain(
-                    smt::RealConstantOp::create(b, loc, R, b.getStringAttr(*s))
-                        .getResult());
-              } else if (auto ia = dyn_cast<IntegerAttr>(a)) {
-                if (ia.getType().getIntOrFloatBitWidth() == 1)
-                  env[o.getResult()] = EncodedValue::plain(
-                      smt::BoolConstantOp::create(
-                          b, loc, Bool, b.getBoolAttr(ia.getValue() != 0))
-                          .getResult());
-                else
-                  env[o.getResult()] = EncodedValue::plain(bvc(ia.getValue()));
-              } else if (auto dea = dyn_cast<DenseElementsAttr>(a)) {
-                if (!dea.isSplat())
-                  return err(o, "non-splat dense constant is unsupported");
-                Type et = dea.getElementType();
-                if (isa<FloatType>(et)) {
-                  auto s = formatReal(dea.getSplatValue<APFloat>());
-                  if (!s)
-                    return err(o, "unsupported float constant (non-finite or "
-                                "exceeds f64 precision)");
-                  env[o.getResult()] = EncodedValue::plain(
-                      smt::RealConstantOp::create(b, loc, R, b.getStringAttr(*s))
-                          .getResult());
-                } else if (auto it = dyn_cast<IntegerType>(et)) {
-                  if (it.getWidth() == 1)
-                    env[o.getResult()] = EncodedValue::plain(
-                        smt::BoolConstantOp::create(
-                            b, loc, Bool,
-                            b.getBoolAttr(!dea.getSplatValue<APInt>().isZero()))
-                            .getResult());
-                  else
-                    env[o.getResult()] = EncodedValue::plain(
-                        bvc(dea.getSplatValue<APInt>()));
-                } else
-                  return err(o, "unsupported constant element type");
-              } else
-                return err(o, "unsupported constant");
+              std::string why;
+              Value v = sb.encodeConstant(o, why);
+              if (!v)
+                return err(o, why);
+              env[o.getResult()] = EncodedValue::plain(v);
               return true;
             })
             .Case<triton::SplatOp>([&](triton::SplatOp o) {
@@ -1058,20 +1214,10 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               auto dstP = dyn_cast<triton::PointerType>(elemOf(o.getType()));
               if (!srcP || !dstP)
                 return err(o, "only pointer-to-pointer bitcast is supported");
-              Type se = srcP.getPointeeType(), de = dstP.getPointeeType();
-              // Only integer<->integer reinterpretations that keep the addressing
-              // granularity (byte size) are sound in this value-based model:
-              // float bitcasts reinterpret bits (e.g. f16 vs bf16 map to the same
-              // real yet differ in memory) and size changes alter the element
-              // stride. The i1<->i8 byte-backed-bool idiom is preserved.
-              auto intBytes = [](Type t) -> int {
-                auto it = dyn_cast<IntegerType>(t);
-                return it ? int((it.getWidth() + 7) / 8) : -1;
-              };
-              if (se != de && (intBytes(se) < 0 || intBytes(de) < 0 ||
-                               intBytes(se) != intBytes(de)))
-                return err(o, "unsupported pointer bitcast: only a same-byte-size "
-                              "integer pointee reinterpretation is modeled");
+              // The soundness rule lives in checkPtrBitcastPointees.
+              if (const char *msg = checkPtrBitcastPointees(
+                      srcP.getPointeeType(), dstP.getPointeeType()))
+                return err(o, msg);
               env[o.getResult()] = env[o.getSrc()];
               return true;
             })
@@ -1140,10 +1286,7 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
                   ubConds.push_back(pa);
                 loaded = ite(mask, loaded, V(o.getOther()));
                 if (Value po = env[o.getOther()].poison) {
-                  Value pfalse = smt::BoolConstantOp::create(
-                                     b, loc, Bool, b.getBoolAttr(false))
-                                     .getResult();
-                  resultPoison = ite(mask, pfalse, po);
+                  resultPoison = ite(mask, sb.boolConst(false), po);
                 }
               } else if (p.poison) {
                 ubConds.push_back(p.poison);
@@ -1158,7 +1301,7 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
               // by the buffer (an i8 written into an i1 buffer means
               // "nonzero").
               Type range = cast<smt::ArrayType>(p.array.getType()).getRangeType();
-              Value v = coerce(V(o.getValue()), range);
+              Value v = sb.coerce(V(o.getValue()), range);
               if (!v)
                 return err(o, "stored value sort is incompatible with the "
                               "buffer sort");
@@ -1195,6 +1338,769 @@ bool ConvertTritonToSMT::encodeFunction(OpBuilder &b, triton::FuncOp func,
   outUB = nullptr;
   for (Value c : ubConds)
     outUB = orPoison(outUB, c);
+  return true;
+}
+
+//===----------------------------------------------------------------------===//
+// Memory-model (phase 3) encoder
+//===----------------------------------------------------------------------===//
+
+bool ConvertTritonToSMT::encodeFunctionMM(
+    OpBuilder &b, triton::FuncOp func, ArrayRef<EncodedValue> sharedArgs,
+    ArrayRef<Value> pids, llvm::MapVector<Value, Value> &memFinal,
+    Value &outUB) {
+  MLIRContext *ctx = &getContext();
+  Location loc = func.getLoc();
+  SMTBuilder sb(b, loc, ctx);
+  auto elemOf = [](Type t) { return SMTBuilder::elemOf(t); };
+
+  if (!func.getBody().hasOneBlock()) {
+    func.emitError("TritonToSMT: only single-block function bodies are "
+                   "supported (external or multi-block functions rejected)");
+    return false;
+  }
+  Block &entry = func.getBody().front();
+
+  DenseMap<Value, EncodedValue> env;
+  for (auto [arg, shared] : llvm::zip(entry.getArguments(), sharedArgs))
+    env[arg] = shared;
+
+  SmallVector<Value> ubConds;
+
+  auto err = [&](Operation *op, const Twine &what) {
+    op->emitError("TritonToSMT: ") << what;
+    return false;
+  };
+  auto isPtrValFn = [&](Value v) {
+    auto it = env.find(v);
+    return it != env.end() && it->second.isPtr();
+  };
+  // Current contents of each block, keyed by its initial array symbol. Loads
+  // read the CURRENT array, so a load placed after a store to the same block
+  // sees the stored values (sequential per-program semantics). As in phases
+  // 1-2, cross-program interference is outside the model: a grid whose
+  // programs race with each other is UB territory the tool does not reason
+  // about, and both kernels are modeled under the same interference-free
+  // assumption.
+  auto curMem = [&](Value arr) -> Value {
+    auto it = memFinal.find(arr);
+    return it == memFinal.end() ? arr : it->second;
+  };
+  auto product = [](ArrayRef<int64_t> shape) {
+    int64_t n = 1;
+    for (int64_t d : shape)
+      n *= d;
+    return n;
+  };
+  // Shared sign-extension terms for i32 offsets entering the 64-bit block
+  // address space. The cache keeps equal source terms mapped to one bv64
+  // term, and the reverse map lets the race-elision matcher reason about the
+  // 32-bit sources (sext is injective).
+  DenseMap<Value, Value> sextCache; // i32 term -> bv64 term
+  DenseMap<Value, Value> sextSrc;   // bv64 term -> i32 source term
+  auto sextOff = [&](Value x32) -> Value {
+    auto it = sextCache.find(x32);
+    if (it != sextCache.end())
+      return it->second;
+    Value r = sb.sextToPtr(x32);
+    sextCache[x32] = r;
+    sextSrc[r] = x32;
+    return r;
+  };
+  // Structural must-differ check on bv64 offsets, looking through the sext
+  // wrapper and a shared base addend. Only used to elide race terms that can
+  // never fire; returning false is always sound.
+  auto provablyDistinctOff = [&](Value a, Value b) -> bool {
+    if (a == b)
+      return false;
+    auto srcOf = [&](Value v) -> Value {
+      auto it = sextSrc.find(v);
+      return it == sextSrc.end() ? Value() : it->second;
+    };
+    if (Value s1 = srcOf(a))
+      if (Value s2 = srcOf(b))
+        return provablyDistinctBV(s1, s2); // sext is injective
+    auto aa = a.getDefiningOp<smt::BVAddOp>();
+    auto ba = b.getDefiningOp<smt::BVAddOp>();
+    if (aa && ba && aa.getLhs() == ba.getLhs()) {
+      Value s1 = srcOf(aa.getRhs()), s2 = srcOf(ba.getRhs());
+      if (s1 && s2)
+        return provablyDistinctBV(s1, s2); // base + sext(x): add is injective
+    }
+    return provablyDistinctBV(a, b);
+  };
+  Value zeroPtr; // lazily-built bv64 zero for the OOB predicate
+  // An access at block offset `off` (bv64) is out of bounds iff it falls
+  // outside [0, size): real pointer arithmetic makes negative offsets land
+  // before the block and size is asserted non-negative in the scope prologue,
+  // so the signed comparisons are exactly the real OOB condition.
+  auto oobOf = [&](Value off, Value size) -> Value {
+    if (!zeroPtr)
+      zeroPtr = sb.ptrConst(0);
+    return sb.bor(sb.bvcmp(smt::BVCmpPredicate::slt, off, zeroPtr),
+                  sb.bvcmp(smt::BVCmpPredicate::sge, off, size));
+  };
+
+  for (Operation &opRef : entry) {
+    Operation *op = &opRef;
+
+    // Type validation: only scalars and static ranked tensors of rank <= 2
+    // whose extent product stays under the max-lanes tractability threshold
+    // are materialized; everything else is rejected loudly ("no silent
+    // caps"). The rank cap bounds implementation complexity; the extent cap
+    // bounds encoder/solver cost, and applies regardless of rank.
+    auto checkType = [&](Type t) -> bool {
+      if (isa<ShapedType>(t) && !isa<RankedTensorType>(t))
+        return err(op,
+                   "unsupported shaped type (only ranked tensors are modeled)");
+      if (auto rt = dyn_cast<RankedTensorType>(t)) {
+        if (!rt.hasStaticShape())
+          return err(op, "dynamic tensor shapes are not supported");
+        if (rt.getRank() > 2)
+          return err(op, "tensors of rank > 2 are not supported in this phase");
+        std::optional<int64_t> ne =
+            ShapedType::tryGetNumElements(rt.getShape());
+        if (!ne || *ne <= 0)
+          return err(op, "tensor extent product is zero or overflows int64");
+        if (maxLanes > 0 && *ne > maxLanes)
+          return err(op, "tensor extent product (" + Twine(*ne) +
+                             ") exceeds the max-lanes tractability threshold "
+                             "(" +
+                             Twine(maxLanes) +
+                             "); the block is rejected rather than silently "
+                             "truncated");
+      }
+      Type e = elemOf(t);
+      if (isa<IndexType>(e))
+        return err(op, "index-typed values are not supported");
+      if (auto it2 = dyn_cast<IntegerType>(e))
+        if (it2.getWidth() == 0)
+          return err(op, "zero-width integers are not supported");
+      return true;
+    };
+    for (Type t : op->getOperandTypes())
+      if (!checkType(t))
+        return false;
+    for (Type t : op->getResultTypes())
+      if (!checkType(t))
+        return false;
+
+    auto resTensorShape = [&]() -> SmallVector<int64_t> {
+      if (op->getNumResults() == 1)
+        if (auto rt = dyn_cast<RankedTensorType>(op->getResult(0).getType()))
+          return SmallVector<int64_t>(rt.getShape());
+      return {};
+    };
+    // Defensive lane-count check: every materialized operand must carry
+    // exactly product(shape) lanes, or laneVal/laneOff would index out of
+    // bounds (a crash, which the contract forbids as much as unsoundness).
+    auto lanesConsistent = [&](const EncodedValue &e) {
+      return e.lanes.empty() ||
+             int64_t(e.lanes.size()) == product(e.shape);
+    };
+
+    std::optional<bool> structural =
+        llvm::TypeSwitch<Operation *, std::optional<bool>>(op)
+            .Case<triton::FuncOp, triton::ReturnOp, triton::ReduceReturnOp>(
+                [&](auto) { return true; })
+            .Case<triton::GetProgramIdOp>(
+                [&](triton::GetProgramIdOp o) -> std::optional<bool> {
+                  int axis = o.getAxisAsInt();
+                  if (axis < 0 || axis >= int(pids.size()))
+                    return err(o, "unsupported program_id axis");
+                  env[o.getResult()] = EncodedValue::plain(pids[axis]);
+                  return true;
+                })
+            .Case<triton::MakeRangeOp>(
+                [&](triton::MakeRangeOp o) -> std::optional<bool> {
+                  SmallVector<int64_t> shape = resTensorShape();
+                  int64_t ext = int64_t(o.getEnd()) - int64_t(o.getStart());
+                  if (shape.size() != 1 || shape[0] != ext)
+                    return err(o, "tt.make_range extent does not match its "
+                                  "result shape");
+                  EncodedValue e;
+                  e.lanes.reserve(ext);
+                  for (int64_t k = 0; k < ext; ++k)
+                    e.lanes.push_back(
+                        sb.addrConst(uint64_t(o.getStart()) + uint64_t(k)));
+                  e.shape = std::move(shape);
+                  env[o.getResult()] = e;
+                  return true;
+                })
+            .Case<triton::SplatOp>(
+                [&](triton::SplatOp o) -> std::optional<bool> {
+                  // A splat keeps the scalar term; laneVal/laneOff broadcast.
+                  EncodedValue e = env[o.getSrc()];
+                  e.shape = resTensorShape();
+                  env[o.getResult()] = e;
+                  return true;
+                })
+            .Case<triton::ExpandDimsOp>(
+                [&](triton::ExpandDimsOp o) -> std::optional<bool> {
+                  // Inserting a 1-extent axis leaves the row-major lane order
+                  // unchanged; only the shape is updated.
+                  EncodedValue e = env[o.getSrc()];
+                  e.shape = resTensorShape();
+                  if (!lanesConsistent(e))
+                    return err(o, "internal lane/shape mismatch");
+                  env[o.getResult()] = e;
+                  return true;
+                })
+            .Case<triton::BroadcastOp>(
+                [&](triton::BroadcastOp o) -> std::optional<bool> {
+                  EncodedValue in = env[o.getSrc()];
+                  SmallVector<int64_t> dst = resTensorShape();
+                  auto srcTy = dyn_cast<RankedTensorType>(o.getSrc().getType());
+                  if (!srcTy || srcTy.getRank() != int64_t(dst.size()))
+                    return err(o, "tt.broadcast must preserve rank");
+                  SmallVector<int64_t> srcShape(srcTy.getShape());
+                  if (in.lanes.empty()) { // splat: only the shape changes
+                    in.shape = std::move(dst);
+                    env[o.getResult()] = in;
+                    return true;
+                  }
+                  if (int64_t(in.lanes.size()) != product(srcShape))
+                    return err(o, "internal lane/shape mismatch");
+                  // Materialized lanes: replicate along the 1-extent axes
+                  // (row-major traversal of the destination shape).
+                  unsigned rank = dst.size();
+                  SmallVector<int64_t> sstr(rank, 1);
+                  for (int r = int(rank) - 2; r >= 0; --r)
+                    sstr[r] = sstr[r + 1] * srcShape[r + 1];
+                  int64_t n = product(dst);
+                  EncodedValue out;
+                  out.array = in.array;
+                  out.size = in.size;
+                  out.fresh = in.fresh;
+                  out.mem = in.mem;
+                  out.poison = in.poison;
+                  out.shape = dst;
+                  out.lanes.reserve(n);
+                  bool anyP = !in.lanePoison.empty();
+                  if (anyP)
+                    out.lanePoison.reserve(n);
+                  SmallVector<int64_t> idx(rank, 0);
+                  for (int64_t k = 0; k < n; ++k) {
+                    int64_t s = 0;
+                    for (unsigned r2 = 0; r2 < rank; ++r2)
+                      s += (srcShape[r2] == 1 ? 0 : idx[r2]) * sstr[r2];
+                    out.lanes.push_back(in.lanes[s]);
+                    if (anyP)
+                      out.lanePoison.push_back(in.lanePoison[s]);
+                    for (int r2 = int(rank) - 1; r2 >= 0; --r2) {
+                      if (++idx[r2] < dst[r2])
+                        break;
+                      idx[r2] = 0;
+                    }
+                  }
+                  env[o.getResult()] = out;
+                  return true;
+                })
+            .Case<arith::ConstantOp>(
+                [&](arith::ConstantOp o) -> std::optional<bool> {
+                  std::string why;
+                  Value v = sb.encodeConstant(o, why);
+                  if (!v)
+                    return err(o, why);
+                  EncodedValue e = EncodedValue::plain(v);
+                  e.shape = resTensorShape(); // dense splats keep their shape
+                  env[o.getResult()] = e;
+                  return true;
+                })
+            .Case<triton::BitcastOp>(
+                [&](triton::BitcastOp o) -> std::optional<bool> {
+                  auto srcP = dyn_cast<triton::PointerType>(
+                      elemOf(o.getSrc().getType()));
+                  auto dstP =
+                      dyn_cast<triton::PointerType>(elemOf(o.getType()));
+                  if (!srcP || !dstP)
+                    return err(o,
+                               "only pointer-to-pointer bitcast is supported");
+                  if (const char *msg = checkPtrBitcastPointees(
+                          srcP.getPointeeType(), dstP.getPointeeType()))
+                    return err(o, msg);
+                  env[o.getResult()] = env[o.getSrc()];
+                  return true;
+                })
+            .Case<triton::AddPtrOp>(
+                [&](triton::AddPtrOp o) -> std::optional<bool> {
+                  Type offElem = elemOf(o.getOffset().getType());
+                  if (!offElem.isInteger(kAddrWidth))
+                    return err(o, "only 32-bit pointer offsets are supported");
+                  EncodedValue base = env[o.getPtr()];
+                  EncodedValue off = env[o.getOffset()];
+                  if (!base.isPtr())
+                    return err(o, "tt.addptr base is not a modeled pointer");
+                  // The sound-by-rejection addressing contract: offsets must
+                  // be pure functions of (pid, scalar args, lane indices).
+                  // A memory-derived offset (gather/scatter, a stride loaded
+                  // from memory, an indirect pointer) is rejected.
+                  if (base.mem || off.mem)
+                    return err(o, "data-dependent addressing: the pointer "
+                                  "offset derives from loaded memory "
+                                  "(gather/scatter and loaded strides are not "
+                                  "supported)");
+                  if (!lanesConsistent(base) || !lanesConsistent(off))
+                    return err(o, "internal lane/shape mismatch");
+                  // Chained tt.addptr is modeled EXACTLY: each link
+                  // sign-extends its i32 offset into the 64-bit block offset
+                  // and accumulates there, as real pointer arithmetic does
+                  // (the legacy path's chain rejection existed because its
+                  // 32-bit accumulation would wrap where reality does not).
+                  // An argument base sits at offset 0; skip the vacuous add
+                  // so per-lane offsets keep the shape the race-elision
+                  // matcher recognizes.
+                  auto addOff = [&](Value baseOff, Value delta32) -> Value {
+                    Value delta = sextOff(delta32);
+                    if (auto c = baseOff.getDefiningOp<smt::BVConstantOp>())
+                      if (c.getValue().getValue().isZero())
+                        return delta;
+                    return smt::BVAddOp::create(b, loc, baseOff, delta)
+                        .getResult();
+                  };
+                  EncodedValue r;
+                  r.array = base.array;
+                  r.size = base.size;
+                  r.fresh = false;
+                  r.mem = false;
+                  r.shape = resTensorShape();
+                  bool anyLanes = !base.lanes.empty() || !off.lanes.empty();
+                  if (anyLanes) {
+                    int64_t n = r.shape.empty() ? 1 : product(r.shape);
+                    if (r.shape.empty())
+                      return err(o, "internal lane/shape mismatch");
+                    SmallVector<Value> ps(n);
+                    bool anyP = false;
+                    r.lanes.reserve(n);
+                    for (int64_t k = 0; k < n; ++k) {
+                      r.lanes.push_back(addOff(base.laneOff(unsigned(k)),
+                                               off.laneVal(unsigned(k))));
+                      // A chained base may carry poison from an earlier
+                      // poisoned offset; the result is poison if either
+                      // contribution is.
+                      ps[k] = sb.orPoison(base.lanePsn(unsigned(k)),
+                                          off.lanePsn(unsigned(k)));
+                      anyP |= ps[k] != nullptr;
+                    }
+                    if (anyP)
+                      r.lanePoison = std::move(ps);
+                  } else {
+                    r.offset = addOff(base.offset, off.value);
+                    r.poison = sb.orPoison(base.poison, off.poison);
+                  }
+                  env[o.getResult()] = r;
+                  return true;
+                })
+            .Case<triton::LoadOp>(
+                [&](triton::LoadOp o) -> std::optional<bool> {
+                  // A volatile load is an observable side effect; a dead
+                  // volatile read would vanish from the model.
+                  if (o.getIsVolatile())
+                    return err(o, "volatile loads are observable and not "
+                                  "modeled");
+                  EncodedValue p = env[o.getPtr()];
+                  if (!p.isPtr() || !p.size)
+                    return err(o, "load through an unmodeled pointer");
+                  if (!lanesConsistent(p))
+                    return err(o, "internal lane/shape mismatch");
+                  Type range =
+                      cast<smt::ArrayType>(p.array.getType()).getRangeType();
+                  Type want = smtSortFor(elemOf(o.getType()), ctx);
+                  if (!want)
+                    return err(o, "unsupported loaded element type");
+                  if (want != range)
+                    return err(o, "load reinterprets the buffer's element "
+                                  "sort via a pointer bitcast; not supported");
+                  SmallVector<int64_t> shape = resTensorShape();
+                  bool scalarLoad = shape.empty();
+                  int64_t n = scalarLoad ? 1 : product(shape);
+                  if (p.isShaped() && p.shape != shape)
+                    return err(o, "pointer/result shapes disagree");
+                  EncodedValue mask, other;
+                  bool hasMask = o.getMask() != nullptr;
+                  if (hasMask) {
+                    // A masked load without `other` leaves masked-out lanes
+                    // undefined in Triton; require the fallback (as in the
+                    // legacy path).
+                    if (!o.getOther())
+                      return err(o, "masked load without a fallback `other` "
+                                    "is undefined and not supported");
+                    mask = env[o.getMask()];
+                    other = env[o.getOther()];
+                    if ((mask.isShaped() && mask.shape != shape) ||
+                        (other.isShaped() && other.shape != shape))
+                      return err(o, "mask/other shapes disagree with the "
+                                    "load");
+                    if (!lanesConsistent(mask) || !lanesConsistent(other))
+                      return err(o, "internal lane/shape mismatch");
+                  }
+                  Value cur = curMem(p.array);
+                  // All-splat operands yield an all-splat result: encode one
+                  // lane and keep the shape.
+                  bool splat = !scalarLoad && p.lanes.empty() &&
+                               (!hasMask || (mask.lanes.empty() &&
+                                             other.lanes.empty()));
+                  int64_t iters = (scalarLoad || splat) ? 1 : n;
+                  SmallVector<Value> ls(iters), ps(iters);
+                  bool anyP = false;
+                  for (int64_t k = 0; k < iters; ++k) {
+                    Value off = p.laneOff(unsigned(k));
+                    Value oob = oobOf(off, p.size);
+                    Value addrPsn = p.lanePsn(unsigned(k));
+                    // UB accounting (exact): a poison mask is UB; a poison
+                    // address or an out-of-bounds access is UB only when the
+                    // lane is active. A masked-out lane performs no access
+                    // and takes `other`. Loaded values are never poison.
+                    if (hasMask) {
+                      Value m = mask.laneVal(unsigned(k));
+                      if (Value pm = mask.lanePsn(unsigned(k)))
+                        ubConds.push_back(pm);
+                      if (Value pa = sb.andCond(m, addrPsn))
+                        ubConds.push_back(pa);
+                      ubConds.push_back(sb.band(m, oob));
+                      ls[k] = sb.ite(m, sb.sel(cur, off, range),
+                                     other.laneVal(unsigned(k)));
+                      if (Value po = other.lanePsn(unsigned(k))) {
+                        ps[k] = sb.ite(m, sb.boolConst(false), po);
+                        anyP = true;
+                      }
+                    } else {
+                      if (addrPsn)
+                        ubConds.push_back(addrPsn);
+                      ubConds.push_back(oob);
+                      ls[k] = sb.sel(cur, off, range);
+                    }
+                  }
+                  EncodedValue r;
+                  if (scalarLoad || splat) {
+                    r.value = ls[0];
+                    r.poison = anyP ? ps[0] : Value();
+                  } else {
+                    r.lanes = std::move(ls);
+                    if (anyP)
+                      r.lanePoison = std::move(ps);
+                  }
+                  r.shape = std::move(shape);
+                  r.mem = true;
+                  env[o.getResult()] = r;
+                  return true;
+                })
+            .Case<triton::StoreOp>(
+                [&](triton::StoreOp o) -> std::optional<bool> {
+                  EncodedValue p = env[o.getPtr()];
+                  if (!p.isPtr() || !p.size)
+                    return err(o, "store through an unmodeled pointer");
+                  Type range =
+                      cast<smt::ArrayType>(p.array.getType()).getRangeType();
+                  EncodedValue val = env[o.getValue()];
+                  EncodedValue mask;
+                  bool hasMask = o.getMask() != nullptr;
+                  if (hasMask)
+                    mask = env[o.getMask()];
+                  SmallVector<int64_t> shape;
+                  if (auto rt =
+                          dyn_cast<RankedTensorType>(o.getValue().getType()))
+                    shape = SmallVector<int64_t>(rt.getShape());
+                  int64_t n = shape.empty() ? 1 : product(shape);
+                  if ((p.isShaped() && p.shape != shape) ||
+                      (val.isShaped() && val.shape != shape) ||
+                      (hasMask && mask.isShaped() && mask.shape != shape))
+                    return err(o, "pointer/value/mask shapes disagree");
+                  if (!lanesConsistent(p) || !lanesConsistent(val) ||
+                      (hasMask && !lanesConsistent(mask)))
+                    return err(o, "internal lane/shape mismatch");
+                  Value cur = curMem(p.array);
+                  SmallVector<Value> offs(n), vals(n), acts(n);
+                  for (int64_t k = 0; k < n; ++k) {
+                    offs[k] = p.laneOff(unsigned(k));
+                    Value v = sb.coerce(val.laneVal(unsigned(k)), range);
+                    if (!v)
+                      return err(o, "stored value sort is incompatible with "
+                                    "the buffer sort");
+                    vals[k] = v;
+                    acts[k] = hasMask ? mask.laneVal(unsigned(k)) : Value();
+                    Value oob = oobOf(offs[k], p.size);
+                    // UB accounting (exact): a poison mask is UB; a poison
+                    // address, a poison stored value, or an out-of-bounds
+                    // write is UB only when the lane is active.
+                    Value execPoison = sb.orPoison(p.lanePsn(unsigned(k)),
+                                                   val.lanePsn(unsigned(k)));
+                    if (hasMask) {
+                      if (Value pm = mask.lanePsn(unsigned(k)))
+                        ubConds.push_back(pm);
+                      if (Value pe = sb.andCond(acts[k], execPoison))
+                        ubConds.push_back(pe);
+                      ubConds.push_back(sb.band(acts[k], oob));
+                    } else {
+                      if (execPoison)
+                        ubConds.push_back(execPoison);
+                      ubConds.push_back(oob);
+                    }
+                  }
+                  // Intra-store write-write race: two active lanes of the
+                  // same store writing DIFFERENT values to the same offset is
+                  // UB (Triton's lanes are parallel; the winner is
+                  // unspecified). Equal-value overlaps are deterministic and
+                  // not UB. Pairs whose offsets are structurally distinct or
+                  // whose value terms coincide can never race and are elided
+                  // -- eliding is sound because the elided term is provably
+                  // false.
+                  for (int64_t k = 0; k < n; ++k)
+                    for (int64_t l = k + 1; l < n; ++l) {
+                      if (vals[k] == vals[l])
+                        continue;
+                      if (provablyDistinctOff(offs[k], offs[l]))
+                        continue;
+                      Value race = sb.band(sb.beq(offs[k], offs[l]),
+                                           sb.bnot(sb.beq(vals[k], vals[l])));
+                      if (acts[k])
+                        race = sb.band(acts[k], race);
+                      if (acts[l])
+                        race = sb.band(acts[l], race);
+                      ubConds.push_back(race);
+                    }
+                  // Fold the lanes into the block's current array. On
+                  // race-free inputs the fold order is irrelevant; racy
+                  // inputs are UB and excluded from the equivalence scope.
+                  for (int64_t k = 0; k < n; ++k) {
+                    Value stored = smt::ArrayStoreOp::create(
+                                       b, loc, cur.getType(), cur, offs[k],
+                                       vals[k])
+                                       .getResult();
+                    cur = acts[k] ? sb.ite(acts[k], stored, cur) : stored;
+                  }
+                  memFinal[p.array] = cur;
+                  return true;
+                })
+            .Case<triton::ReduceOp>(
+                [&](triton::ReduceOp o) -> std::optional<bool> {
+                  if (o->getNumOperands() != 1 || o->getNumResults() != 1)
+                    return err(o, "only single-input/single-result tt.reduce "
+                                  "is supported (fused arg-reduce is "
+                                  "rejected)");
+                  auto srcTy =
+                      dyn_cast<RankedTensorType>(o->getOperand(0).getType());
+                  if (!srcTy || !srcTy.hasStaticShape() ||
+                      srcTy.getRank() < 1 || srcTy.getRank() > 2)
+                    return err(o, "only static rank-1/rank-2 reductions are "
+                                  "supported");
+                  int64_t axis = o.getAxis();
+                  if (axis < 0 || axis >= srcTy.getRank())
+                    return err(o, "reduction axis out of range");
+                  Operation *comb = o.getSingleCombiner();
+                  if (!comb)
+                    return err(o, "unsupported tt.reduce combiner region "
+                                  "(non-canonical or fused arg-reduce)");
+                  // Require the region to be exactly {combiner,
+                  // reduce.return}; getSingleCombiner tolerates extra ops it
+                  // would silently drop.
+                  Block &combBlock = o.getCombineOp().front();
+                  if (combBlock.getOperations().size() != 2)
+                    return err(o, "tt.reduce combiner region must contain "
+                                  "only the combining op and the terminator");
+                  if (!isa<arith::AddFOp, arith::MaxNumFOp, arith::MaximumFOp,
+                           arith::MinNumFOp, arith::MinimumFOp>(comb))
+                    return err(o, "unsupported tt.reduce combiner '" +
+                                      comb->getName().getStringRef() +
+                                      "' (supported: addf, max/minnumf, "
+                                      "max/minimumf)");
+                  EncodedValue in = env[o->getOperand(0)];
+                  SmallVector<int64_t> srcShape(srcTy.getShape());
+                  int64_t total = product(srcShape);
+                  if (!in.lanes.empty() &&
+                      int64_t(in.lanes.size()) != total)
+                    return err(o, "internal lane/shape mismatch");
+                  Type laneSort;
+                  if (!in.lanes.empty())
+                    laneSort = in.lanes.front().getType();
+                  else if (in.value)
+                    laneSort = in.value.getType();
+                  // Float (ideal-real) reductions only: the fixed fold order
+                  // below is only provably order-independent because the
+                  // whitelisted combiners are associative and commutative
+                  // over ideal reals.
+                  if (!laneSort || !isa<smt::RealType>(laneSort))
+                    return err(o, "only floating-point (real) reductions are "
+                                  "supported");
+                  auto combine = [&](Value acc, Value x) -> Value {
+                    auto A = [&](Value v) -> Value {
+                      if (v == combBlock.getArgument(0))
+                        return acc;
+                      if (v == combBlock.getArgument(1))
+                        return x;
+                      return Value();
+                    };
+                    auto Pnone = [](Value) -> Value { return Value(); };
+                    auto noPtr = [](Value) { return false; };
+                    std::string why;
+                    Value ignored;
+                    return sb.encodeElementwise(comb, A, Pnone, noPtr, ignored,
+                                                why);
+                  };
+                  int64_t redN = srcShape[axis];
+                  int64_t outN = total / redN;
+                  int64_t s1 = srcShape.size() == 2 ? srcShape[1] : 1;
+                  SmallVector<Value> outLanes(outN), outPs(outN);
+                  bool anyP = false;
+                  for (int64_t j = 0; j < outN; ++j) {
+                    Value acc, psn;
+                    for (int64_t r = 0; r < redN; ++r) {
+                      int64_t lin;
+                      if (srcShape.size() == 1)
+                        lin = r;
+                      else if (axis == 0)
+                        lin = r * s1 + j;
+                      else
+                        lin = j * s1 + r;
+                      Value x = in.laneVal(unsigned(lin));
+                      acc = (r == 0) ? x : combine(acc, x);
+                      if (!acc)
+                        return err(o, "failed to encode tt.reduce combiner");
+                      // The whitelisted combiners are poison-strict, so the
+                      // fold's poison is exactly the lane-poison disjunction.
+                      psn = sb.orPoison(psn, in.lanePsn(unsigned(lin)));
+                    }
+                    outLanes[j] = acc;
+                    outPs[j] = psn;
+                    anyP |= psn != nullptr;
+                  }
+                  EncodedValue r;
+                  r.mem = in.mem;
+                  if (srcTy.getRank() == 1) {
+                    r.value = outLanes[0];
+                    r.poison = anyP ? outPs[0] : Value();
+                  } else {
+                    r.shape = {srcShape[1 - axis]};
+                    r.lanes = std::move(outLanes);
+                    if (anyP)
+                      r.lanePoison = std::move(outPs);
+                  }
+                  env[o->getResult(0)] = r;
+                  return true;
+                })
+            .Case<triton::ReshapeOp>(
+                [&](triton::ReshapeOp o) -> std::optional<bool> {
+                  // Same narrow idiom as the reduction path: an
+                  // identity-extent rank-1 flattening whose ONLY user is a
+                  // tt.reduce. Any fold order is admissible there (the reduce
+                  // whitelist admits only associative+commutative combiners
+                  // over ideal reals, and allow_reorder leaves the order
+                  // unspecified anyway); feeding lane-wise arithmetic would
+                  // make the pairing nondeterministic and is rejected.
+                  EncodedValue in = env[o.getSrc()];
+                  auto st = dyn_cast<RankedTensorType>(o.getType());
+                  bool soleReduceUser =
+                      o.getResult().hasOneUse() &&
+                      isa<triton::ReduceOp>(*o.getResult().getUsers().begin());
+                  if (soleReduceUser && st && st.getRank() == 1 &&
+                      st.hasStaticShape() && in.isShaped() &&
+                      lanesConsistent(in) &&
+                      st.getShape()[0] == product(in.shape)) {
+                    EncodedValue r = in;
+                    r.shape = {st.getShape()[0]};
+                    env[o.getResult()] = r;
+                    return true;
+                  }
+                  return err(o, "tt.reshape is only supported as an "
+                                "identity-extent rank-1 view feeding a "
+                                "tt.reduce");
+                })
+            .Default([](Operation *) { return std::nullopt; });
+
+    if (structural) {
+      if (!*structural)
+        return false;
+      continue;
+    }
+
+    // Elementwise fallback: scalar, all-splat, or per-lane vector context.
+    SmallVector<int64_t> eshape;
+    bool anyLanes = false, memTaint = false;
+    for (Value operand : op->getOperands()) {
+      auto it = env.find(operand);
+      if (it == env.end())
+        continue;
+      memTaint |= it->second.mem;
+      if (it->second.isShaped()) {
+        if (eshape.empty())
+          eshape = it->second.shape;
+        else if (eshape != it->second.shape)
+          return err(op, "operand shapes disagree");
+        if (!lanesConsistent(it->second))
+          return err(op, "internal lane/shape mismatch");
+        anyLanes |= !it->second.lanes.empty();
+      }
+    }
+    if (op->getNumResults() != 1)
+      return err(op, "unsupported operation '" +
+                         op->getName().getStringRef() + "'");
+    // Elementwise ops are shape-preserving; a result shape that disagrees
+    // with the operands' means this is not an elementwise op.
+    if (resTensorShape() != eshape)
+      return err(op, "unsupported operation '" +
+                         op->getName().getStringRef() +
+                         "' (result shape disagrees with its operands)");
+
+    auto rejectMsg = [&](const std::string &why) {
+      return why.empty() ? ("operation '" + op->getName().getStringRef() +
+                            "' is not supported")
+                               .str()
+                         : why;
+    };
+    if (eshape.empty() || !anyLanes) {
+      // Scalar (or all-splat) context: encode once; a splat result keeps the
+      // shape so downstream broadcasting stays cheap.
+      auto A = [&](Value v) -> Value {
+        auto it = env.find(v);
+        return it == env.end() ? Value() : it->second.value;
+      };
+      auto P = [&](Value v) -> Value {
+        auto it = env.find(v);
+        return it == env.end() ? Value() : it->second.poison;
+      };
+      std::string why;
+      Value psn;
+      Value r = sb.encodeElementwise(op, A, P, isPtrValFn, psn, why);
+      if (!r)
+        return err(op, rejectMsg(why));
+      EncodedValue e = EncodedValue::plain(r, psn);
+      e.shape = eshape;
+      e.mem = memTaint;
+      env[op->getResult(0)] = e;
+      continue;
+    }
+    int64_t n = product(eshape);
+    SmallVector<Value> ls(n), ps(n);
+    bool anyP = false;
+    for (int64_t k = 0; k < n; ++k) {
+      auto A = [&](Value v) -> Value {
+        auto it = env.find(v);
+        return it == env.end() ? Value() : it->second.laneVal(unsigned(k));
+      };
+      auto P = [&](Value v) -> Value {
+        auto it = env.find(v);
+        return it == env.end() ? Value() : it->second.lanePsn(unsigned(k));
+      };
+      std::string why;
+      Value psn;
+      Value r = sb.encodeElementwise(op, A, P, isPtrValFn, psn, why);
+      if (!r)
+        return err(op, rejectMsg(why));
+      ls[k] = r;
+      ps[k] = psn;
+      anyP |= psn != nullptr;
+    }
+    EncodedValue e =
+        EncodedValue::vec(std::move(ls), anyP ? std::move(ps)
+                                              : SmallVector<Value>{});
+    e.shape = eshape;
+    e.mem = memTaint;
+    env[op->getResult(0)] = e;
+  }
+
+  outUB = nullptr;
+  for (Value c : ubConds)
+    outUB = sb.orPoison(outUB, c);
   return true;
 }
 
@@ -1351,8 +2257,153 @@ void ConvertTritonToSMT::runOnOperation() {
     return true;
   };
 
-  if (!buildScope(/*addressing=*/0) || !buildScope(/*ub-domain=*/1) ||
-      !buildScope(/*equivalence=*/2))
+  // Memory-model scope builder (phase 3). The same three scopes are emitted
+  // in the same order so the driver's positional contract is untouched:
+  //   scope 0: a documented, trivially-unsat placeholder. Under the block
+  //     model, addressing correctness is no longer a separate identity proof:
+  //     every access either decomposes to a known block with a modeled
+  //     per-lane offset or is rejected, and distinct blocks are disjoint SMT
+  //     arrays by construction, so there is no residual addressing fact to
+  //     check. Intra-store write-write races were the one candidate fact and
+  //     are UB (scope 1) instead. See docs/smt-tv/phase-3.md.
+  //   scope 1: UB-domain equality, now also covering out-of-bounds active
+  //     accesses and intra-store races besides poison reaching memory.
+  //   scope 2: per-block final-state equality on inputs where neither
+  //     function is UB (whole-array equality: unwritten offsets trivially
+  //     agree because both sides share the initial array symbols, so this is
+  //     exactly per-offset equality over the written blocks).
+  auto buildScopeMM = [&](int mode) -> bool {
+    builder.setInsertionPointToEnd(module.getBody());
+    auto solver =
+        smt::SolverOp::create(builder, loc, TypeRange{}, ValueRange{});
+    Block *body = builder.createBlock(&solver.getBodyRegion());
+    builder.setInsertionPointToStart(body);
+    smt::SetLogicOp::create(builder, loc, builder.getStringAttr("ALL"));
+    SMTBuilder sb(builder, loc, ctx);
+
+    auto addrTy = smt::BitVectorType::get(ctx, kAddrWidth);
+    // One symbolic program instance: the three grid axes are free symbols
+    // shared by both functions (per-program refinement -- the same grid
+    // launches both kernels, so proving every program id equivalent proves
+    // the launch equivalent under the interference-free assumption).
+    SmallVector<Value> pids;
+    for (unsigned a = 0; a < 3; ++a)
+      pids.push_back(smt::DeclareFunOp::create(
+                         builder, loc, addrTy,
+                         builder.getStringAttr(("pid" + Twine(a)).str()))
+                         .getResult());
+    auto ptrTyBV = smt::BitVectorType::get(ctx, kPtrWidth);
+    Value zeroOff = sb.ptrConst(0);
+    SmallVector<EncodedValue> shared;
+    for (auto [idx, argTy] : llvm::enumerate(argTypes)) {
+      std::string name = ("arg" + Twine(idx)).str();
+      if (auto ptrTy = dyn_cast<triton::PointerType>(argTy)) {
+        Type range = smtSortFor(ptrTy.getPointeeType(), ctx);
+        if (!range) {
+          module.emitError("TritonToSMT: unsupported pointee type ")
+              << ptrTy.getPointeeType();
+          return false;
+        }
+        // Blocks live in a 64-bit offset space (see kPtrWidth): the array is
+        // indexed by bv64 and the element count is a bv64 constrained to be
+        // non-negative, so the signed OOB predicate `off < 0 or off >= size`
+        // is exactly the real out-of-allocation condition.
+        auto arrTy = smt::ArrayType::get(ctx, ptrTyBV, range);
+        // The block: fully-initialized symbolic contents plus a symbolic
+        // element count. Distinct arguments are distinct SMT arrays, which
+        // formalizes the phase-1 "pointer args are disjoint" (restrict)
+        // assumption. Memory is modeled as always readable (CUDA global
+        // memory holds SOME value); reading an offset the kernel has not
+        // written is defined-but-unknown, not UB -- see phase-3.md for why
+        // this deliberately diverges from mlir-tv's uninitialized-read UB.
+        Value arr = smt::DeclareFunOp::create(builder, loc, arrTy,
+                                              builder.getStringAttr(name))
+                        .getResult();
+        Value size = smt::DeclareFunOp::create(
+                         builder, loc, ptrTyBV,
+                         builder.getStringAttr(name + "_size"))
+                         .getResult();
+        smt::AssertOp::create(
+            builder, loc,
+            sb.bvcmp(smt::BVCmpPredicate::sge, size, zeroOff));
+        EncodedValue e = EncodedValue::ptr(arr, zeroOff, /*fresh=*/true);
+        e.size = size;
+        shared.push_back(e);
+      } else if (Type sort = smtSortFor(argTy, ctx)) {
+        shared.push_back(EncodedValue::plain(
+            smt::DeclareFunOp::create(builder, loc, sort,
+                                      builder.getStringAttr(name))
+                .getResult()));
+      } else {
+        module.emitError("TritonToSMT: unsupported argument type ") << argTy;
+        return false;
+      }
+    }
+
+    llvm::MapVector<Value, Value> memS, memT;
+    Value ubS = nullptr, ubT = nullptr;
+    if (!encodeFunctionMM(builder, src, shared, pids, memS, ubS) ||
+        !encodeFunctionMM(builder, tgt, shared, pids, memT, ubT))
+      return false;
+
+    auto boolOrFalse = [&](Value v) -> Value {
+      return v ? v : sb.boolConst(false);
+    };
+    Value assertion;
+    if (mode == 0) {
+      assertion = sb.boolConst(false); // vestigial: see the comment above
+    } else if (mode == 1) {
+      assertion = smt::DistinctOp::create(builder, loc, boolOrFalse(ubS),
+                                          boolOrFalse(ubT))
+                      .getResult();
+    } else {
+      SmallVector<Value> diffs;
+      for (const EncodedValue &e : shared) {
+        if (!e.isPtr())
+          continue;
+        Value arr = e.array;
+        if (!memS.count(arr) && !memT.count(arr))
+          continue; // neither function writes this block
+        auto finalOf = [&](llvm::MapVector<Value, Value> &m) {
+          auto it = m.find(arr);
+          return it == m.end() ? arr : it->second;
+        };
+        diffs.push_back(smt::DistinctOp::create(builder, loc, finalOf(memS),
+                                                finalOf(memT))
+                            .getResult());
+      }
+      // No writes on either side: nothing observable can differ.
+      assertion = diffs.empty() ? sb.boolConst(false) : diffs.front();
+      for (size_t k = 1; k < diffs.size(); ++k)
+        assertion = sb.bor(assertion, diffs[k]);
+      // Outputs need only agree where neither function is UB (bidirectional
+      // refinement); on the -- provably shared, per scope 1 -- UB domain any
+      // behavior is allowed.
+      for (Value ub : {ubS, ubT})
+        if (ub)
+          assertion = sb.band(sb.bnot(ub), assertion);
+    }
+    smt::AssertOp::create(builder, loc, assertion);
+
+    auto check = smt::CheckOp::create(builder, loc, TypeRange{});
+    fillCheckRegions(builder, loc, check);
+    builder.setInsertionPointToEnd(body);
+    smt::YieldOp::create(builder, loc, ValueRange{});
+    return true;
+  };
+
+  if (memoryModel && blockSize > 0) {
+    module.emitError(
+        "TritonToSMT: block-size applies only to the identity-addressing "
+        "path; do not combine it with memory-model");
+    return signalPassFailure();
+  }
+  bool built = memoryModel
+                   ? (buildScopeMM(0) && buildScopeMM(1) && buildScopeMM(2))
+                   : (buildScope(/*addressing=*/0) &&
+                      buildScope(/*ub-domain=*/1) &&
+                      buildScope(/*equivalence=*/2));
+  if (!built)
     return signalPassFailure();
 
   // Remove all non-SMT ops so the module can be exported with mlir-translate.

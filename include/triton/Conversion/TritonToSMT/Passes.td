@@ -32,6 +32,18 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
     The encoding is operation-wise: every supported Triton/arith/math operation
     has its own local encoding rule. It currently targets straight-line,
     elementwise kernels and 1-D reductions (no loops or atomics).
+
+    With `memory-model` set (phase 3), the identity-addressing restriction is
+    replaced by a block memory model: every pointer argument becomes a
+    distinct block (an SMT array plus a symbolic element count), tensors are
+    materialized as concrete lanes with a static shape (rank <= 2, extent
+    product bounded by `max-lanes`), and per-lane symbolic offsets replace the
+    identity proof. Out-of-bounds accesses by an active lane, poison reaching
+    a memory op, and two active lanes of one store writing different values
+    to the same offset (an intra-store race) all fold into the UB predicate
+    checked by scope 1. The same three scopes are emitted in the same order;
+    scope 0 carries a trivially-unsat placeholder assertion because block
+    decomposition is total by construction (anything else is rejected).
   }];
 
   let dependentDialects = ["mlir::arith::ArithDialect",
@@ -45,7 +57,19 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
     Option<"tgtFunc", "tgt", "std::string", /*default*/"\"\"",
            "name of the target function (default: second function in module)">,
     Option<"blockSize", "block-size", "int64_t", /*default*/"0",
-           "block size; 0 infers it from tt.make_range (scalar kernels use 1)">,
+           "block size; 0 infers it from tt.make_range (scalar kernels use 1); "
+           "only meaningful for the identity-addressing path (rejected when "
+           "combined with memory-model)">,
+    Option<"memoryModel", "memory-model", "bool", /*default*/"false",
+           "use the phase-3 block memory model: one block per pointer "
+           "argument with a symbolic element count, tensors materialized as "
+           "concrete lanes (rank <= 2), out-of-bounds and intra-store-race "
+           "accesses folded into the UB predicate; scope 0 becomes a "
+           "documented always-unsat placeholder">,
+    Option<"maxLanes", "max-lanes", "int64_t", /*default*/"256",
+           "memory-model mode: maximum tensor extent product materialized as "
+           "concrete lanes; larger tensors are rejected loudly (encoder and "
+           "solver tractability bound, independent of the rank <= 2 cap)">,
   ];
 }
 

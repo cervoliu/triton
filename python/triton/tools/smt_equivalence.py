@@ -184,7 +184,13 @@ def build_query_module(src_ttir: str, tgt_ttir: str, triton_opt: str) -> str:
 @dataclass
 class EquivalenceResult:
     verdict: str             # EQUIVALENT | NOT_EQUIVALENT | UNSUPPORTED | UNKNOWN
-    addressing_status: str   # z3 result of the addressing-identity scope
+    # z3 result of scope 0. On the identity-addressing (legacy) path this is
+    # the addressing-identity check (sat => non-identity addressing, which
+    # triggers the memory-model retry). On the memory-model path scope 0 is a
+    # documented always-unsat placeholder -- addressing correctness is part of
+    # the block decomposition itself -- kept so the three-scope positional
+    # contract is unchanged (see docs/smt-tv/phase-3.md).
+    addressing_status: str
     equivalence_status: str  # z3 result of the equivalence scope
     smtlib: str
     z3_output: str
@@ -193,6 +199,9 @@ class EquivalenceResult:
     # UB, so they are not mutually refining). Defaults to "n/a" for results
     # produced before the solver stage.
     ub_status: str = "n/a"
+    # True iff this result came from the phase-3 block-memory-model encoding
+    # (the retry path for kernels the identity-addressing path cannot handle).
+    memory_model: bool = False
 
     @property
     def equivalent(self) -> bool:
@@ -209,6 +218,16 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
     Kernel-dependent failures (unsupported constructs, solver timeouts) become
     verdicts (UNSUPPORTED/UNKNOWN); environment errors (missing, unpatched, or
     pass-less tools) raise RuntimeError with an actionable message.
+
+    Routing (phase 3): the identity-addressing encoding is tried first. When
+    it rejects the kernels, or accepts them but scope 0 proves the addressing
+    is not identity, the check is retried once with the block memory model
+    (``--convert-triton-to-smt=memory-model=true``), which handles strided,
+    multi-dimensional, and masked addressing; ``memory_model`` on the result
+    records which encoding produced the verdict. An explicit ``block_size``
+    pins the identity-addressing contract and disables the retry (the option
+    is a legacy-path cross-check with no memory-model counterpart). The retry
+    can double the worst-case runtime (two solver runs of up to ``timeout``).
     """
     triton_opt = triton_opt or default_triton_opt()
     mlir_translate = mlir_translate or default_mlir_translate()
@@ -237,83 +256,112 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
         module = build_query_module(src_ttir, tgt_ttir, triton_opt)
     except RuntimeError as e:
         return EquivalenceResult("UNSUPPORTED", "n/a", "n/a", "", str(e))
-    pass_opt = "--convert-triton-to-smt"
-    if block_size > 0:
-        pass_opt = f"--convert-triton-to-smt=block-size={block_size}"
-    # The pass fails (signalPassFailure) for inputs outside its validated
-    # contract; treat that as UNSUPPORTED rather than a hard error. A triton-opt
-    # that does not register the pass at all is an environment error, not a
-    # kernel verdict: mapping it to UNSUPPORTED would make every rejection test
-    # pass vacuously, so fail loudly instead.
-    try:
-        smt_mlir = _run([triton_opt, pass_opt], module)
-    except RuntimeError as e:
-        if "Unknown command line argument" in str(e):
-            raise RuntimeError(
-                f"{triton_opt} does not register --convert-triton-to-smt; "
-                "build triton-opt from a tree containing the TritonToSMT "
-                "pass") from e
-        return EquivalenceResult("UNSUPPORTED", "n/a", "n/a", "", str(e))
-    # The exporter's input is pass output, so a failure here is an environment
-    # error (typically an mlir-translate without scripts/patches/
-    # mlir-smt-real.patch); raise it with an actionable message.
-    try:
-        smtlib = _run([mlir_translate, "--export-smtlib"], smt_mlir)
-    except RuntimeError as e:
-        if "smt.real" in str(e):
-            raise RuntimeError(
-                f"{mlir_translate} cannot handle the SMT Real sort; apply "
-                "scripts/patches/mlir-smt-real.patch (see "
-                "scripts/build-llvm-project.sh) and rebuild") from e
-        raise
 
-    # Solve first without (get-model): scope 0 = addressing, scope 1 =
-    # UB-domain equality, scope 2 = equivalence (the pass always emits all
-    # three, in this order). A solver timeout is a documented UNKNOWN, not an
-    # exception.
-    try:
-        z3_out = _run([z3, "-in"], smtlib, timeout=timeout)
-    except (subprocess.TimeoutExpired, ValueError, OverflowError):
-        # TimeoutExpired = genuine timeout; ValueError/OverflowError = a timeout
-        # value subprocess cannot represent. Both are a documented UNKNOWN.
-        return EquivalenceResult("UNKNOWN", "timeout", "timeout", smtlib,
-                                 f"z3 timed out or timeout unrepresentable ({timeout})",
-                                 "timeout")
-    # Require exactly three solver results rather than trusting line positions,
-    # so an unexpected extra scope cannot be misread as a verdict.
-    results = [ln.strip() for ln in z3_out.splitlines()
-               if ln.strip() in ("sat", "unsat", "unknown")]
-    if len(results) != 3:
-        return EquivalenceResult("UNKNOWN", "n/a", "n/a", smtlib, z3_out)
-    addr, ub, equiv = results
-    if addr == "sat":
-        verdict = "UNSUPPORTED"  # non-identity addressing is not modeled
-    elif ub != "unsat" and addr == "unsat":
-        # sat: some input makes exactly one kernel UB (e.g. it stores an
-        # oversized-shift result where the other stores a defined value), so
-        # they do not mutually refine each other.
-        verdict = "NOT_EQUIVALENT" if ub == "sat" else "UNKNOWN"
-    elif addr == "unsat":
-        verdict = {"unsat": "EQUIVALENT",
-                   "sat": "NOT_EQUIVALENT"}.get(equiv, "UNKNOWN")
-    else:
-        verdict = "UNKNOWN"
+    def _pipeline(pass_opt: str, memory_model: bool) -> EquivalenceResult:
+        # The pass fails (signalPassFailure) for inputs outside its validated
+        # contract; treat that as UNSUPPORTED rather than a hard error. A
+        # triton-opt that does not register the pass (or, on the retry, one
+        # too old to know the memory-model option) is an environment error,
+        # not a kernel verdict: mapping it to UNSUPPORTED would make every
+        # rejection test pass vacuously, so fail loudly instead.
+        try:
+            smt_mlir = _run([triton_opt, pass_opt], module)
+        except RuntimeError as e:
+            if "Unknown command line argument" in str(e):
+                raise RuntimeError(
+                    f"{triton_opt} does not register --convert-triton-to-smt; "
+                    "build triton-opt from a tree containing the TritonToSMT "
+                    "pass") from e
+            if memory_model and "no such option" in str(e):
+                raise RuntimeError(
+                    f"{triton_opt} does not know the memory-model pass "
+                    "option; rebuild triton-opt from a tree containing the "
+                    "phase-3 TritonToSMT pass") from e
+            return EquivalenceResult("UNSUPPORTED", "n/a", "n/a", "", str(e),
+                                     memory_model=memory_model)
+        # The exporter's input is pass output, so a failure here is an
+        # environment error (typically an mlir-translate without
+        # scripts/patches/mlir-smt-real.patch); raise it actionably.
+        try:
+            smtlib = _run([mlir_translate, "--export-smtlib"], smt_mlir)
+        except RuntimeError as e:
+            if "smt.real" in str(e):
+                raise RuntimeError(
+                    f"{mlir_translate} cannot handle the SMT Real sort; apply "
+                    "scripts/patches/mlir-smt-real.patch (see "
+                    "scripts/build-llvm-project.sh) and rebuild") from e
+            raise
+
+        # Solve without (get-model): scope 0 = addressing, scope 1 = UB-domain
+        # equality, scope 2 = equivalence (the pass always emits all three, in
+        # this order, in BOTH encodings). A solver timeout is a documented
+        # UNKNOWN, not an exception.
+        try:
+            z3_out = _run([z3, "-in"], smtlib, timeout=timeout)
+        except (subprocess.TimeoutExpired, ValueError, OverflowError):
+            # TimeoutExpired = genuine timeout; ValueError/OverflowError = a
+            # timeout value subprocess cannot represent. Both are a documented
+            # UNKNOWN.
+            return EquivalenceResult(
+                "UNKNOWN", "timeout", "timeout", smtlib,
+                f"z3 timed out or timeout unrepresentable ({timeout})",
+                "timeout", memory_model=memory_model)
+        # Require exactly three solver results rather than trusting line
+        # positions, so an unexpected extra scope cannot be misread as a
+        # verdict.
+        results = [ln.strip() for ln in z3_out.splitlines()
+                   if ln.strip() in ("sat", "unsat", "unknown")]
+        if len(results) != 3:
+            return EquivalenceResult("UNKNOWN", "n/a", "n/a", smtlib, z3_out,
+                                     memory_model=memory_model)
+        addr, ub, equiv = results
+        if addr == "sat":
+            # Non-identity addressing on the legacy path (the memory-model
+            # scope 0 is always unsat); the caller retries with the block
+            # memory model.
+            verdict = "UNSUPPORTED"
+        elif ub != "unsat" and addr == "unsat":
+            # sat: some input makes exactly one kernel UB (e.g. it stores an
+            # oversized-shift result, or accesses out of bounds, where the
+            # other is defined), so they do not mutually refine each other.
+            verdict = "NOT_EQUIVALENT" if ub == "sat" else "UNKNOWN"
+        elif addr == "unsat":
+            verdict = {"unsat": "EQUIVALENT",
+                       "sat": "NOT_EQUIVALENT"}.get(equiv, "UNKNOWN")
+        else:
+            verdict = "UNKNOWN"
+        return EquivalenceResult(verdict, addr, equiv, smtlib, z3_out, ub,
+                                 memory_model=memory_model)
+
+    legacy_opt = "--convert-triton-to-smt"
+    if block_size > 0:
+        legacy_opt = f"--convert-triton-to-smt=block-size={block_size}"
+    res = _pipeline(legacy_opt, memory_model=False)
+    # Phase-3 routing: fall back to the block memory model when the
+    # identity-addressing encoding rejected the kernels or disproved identity
+    # addressing (scope 0 sat). An explicit block_size pins the legacy
+    # contract, so no retry. UNKNOWN results are NOT retried: the legacy
+    # encoding accepted the kernels and only the solver struggled.
+    if block_size <= 0 and (res.verdict == "UNSUPPORTED"
+                            or res.addressing_status == "sat"):
+        res = _pipeline("--convert-triton-to-smt=memory-model=true",
+                        memory_model=True)
 
     # Request a counterexample model only once we know the equivalence scope is
     # sat; asking after unsat/unknown makes z3 error with "model not available".
-    if counterexample and verdict == "NOT_EQUIVALENT":
-        idx = smtlib.rfind("(check-sat)")
+    if counterexample and res.verdict == "NOT_EQUIVALENT":
+        idx = res.smtlib.rfind("(check-sat)")
         if idx >= 0:
             end = idx + len("(check-sat)")
-            model_query = smtlib[:end] + "\n(get-model)" + smtlib[end:]
+            model_query = res.smtlib[:end] + "\n(get-model)" + res.smtlib[end:]
             try:
-                z3_out = _run([z3, "-in"], model_query, timeout=timeout)
+                res.z3_output = _run([z3, "-in"], model_query, timeout=timeout)
             except (subprocess.TimeoutExpired, RuntimeError):
                 # Keep the verdict; the model is best-effort. The rerun can
                 # nondeterministically flip to unknown, making z3 exit nonzero
                 # on (get-model) ("model is not available").
                 pass
-    return EquivalenceResult(verdict, addr, equiv, smtlib, z3_out, ub)
+    return res
 
 
 def check_kernels(src_fn, tgt_fn, signature: dict, *,

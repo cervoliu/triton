@@ -186,8 +186,9 @@ Per-function results confirm every definition in
 `test/Conversion/triton_to_smt*.mlir` is EQUIVALENT under all four passes
 (8+16+8+8 = 40/40). A zero-work sweep (missing/empty corpus, empty or
 unrecognized pass, zero attempts, or a pass failing on every definition)
-exits nonzero. Growing the EQUIVALENT column is the phase-3 coverage agenda
-(loops, `tt.dot`, stride-general addressing).
+exits nonzero. Growing the EQUIVALENT column is the phase-3 coverage agenda: phase 3
+(`phase-3.md`) tackles **stride-general addressing** via a real block memory
+model; `tt.dot` and loops follow in phase 4.
 
 ## Working method
 

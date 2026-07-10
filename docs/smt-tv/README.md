@@ -31,6 +31,16 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
 - [`phase-2-review.md`](phase-2-review.md) — the approved Codex review of
   phase-2 milestones 2–4 (latest round; earlier rounds' findings are pinned
   as regression tests).
+- [`phase-3.md`](phase-3.md) — phase 3, IMPLEMENTED (in review): a block
+  memory model absorbed from mlir-tv — one block per pointer argument (bv64
+  offsets, symbolic size), N-D lane materialization (rank ≤ 2), OOB and
+  intra-store races as UB — behind the `memory-model` pass option; the driver
+  retries with it when the identity-addressing path rejects or disproves
+  identity (scope 0 sat). Its "Implementation notes" section records every
+  deliberate divergence from the plan (no uninitialized-read UB; chained
+  addptr modeled exactly in 64-bit instead of rejected; data-dependence taint
+  instead of literal affine decomposition). `tt.dot`/`scf.for` deferred to
+  phase 4.
 
 ## Review harness
 
