@@ -22,6 +22,9 @@ and will not compile the pass. This is an accepted build-integration dependency
   applied on top of the pinned LLVM by `scripts/build-llvm-project.sh`.
 - **Part B — `lib/Conversion/TritonToSMT`** (`triton-opt --convert-triton-to-smt`).
   Encodes two `tt.func`s into the `smt` dialect and emits two solver scopes.
+  *(Superseded in phase 2: the pass now always emits THREE scopes —
+  0 addressing, 1 UB-domain equality, 2 equivalence — see `phase-2.md`
+  milestone 3.)*
 - **Part C — driver `python/triton/tools/smt_equivalence.py`**. Compiles kernels
   to TTIR (frontend only, no GPU/`ptxas`), merges them, runs the pass →
   `mlir-translate --export-smtlib` → Z3, and returns a verdict.
