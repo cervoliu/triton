@@ -1,5 +1,11 @@
 // RUN: triton-opt %s --convert-triton-to-smt=memory-model=true | FileCheck %s
 // RUN: triton-opt %s --convert-triton-to-smt=memory-model=true | mlir-translate --export-smtlib | FileCheck %s --check-prefix=SMTLIB
+// The extent-product tractability guard is mandatory: a non-positive
+// max-lanes is rejected up front, never treated as "unlimited" (the race
+// construction is quadratic in the lane count).
+// RUN: not triton-opt %s --convert-triton-to-smt='memory-model=true max-lanes=0' 2>&1 | FileCheck %s --check-prefix=BADCAP
+// RUN: not triton-opt %s --convert-triton-to-smt='memory-model=true max-lanes=-4' 2>&1 | FileCheck %s --check-prefix=BADCAP
+// BADCAP: max-lanes must be positive
 
 // Phase-3 block memory model: a 2x2 strided, masked tile store. Each pointer
 // argument becomes a block (bv64-indexed array + non-negative symbolic size);

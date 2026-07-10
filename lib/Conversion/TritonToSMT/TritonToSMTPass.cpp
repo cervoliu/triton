@@ -1462,7 +1462,10 @@ bool ConvertTritonToSMT::encodeFunctionMM(
             ShapedType::tryGetNumElements(rt.getShape());
         if (!ne || *ne <= 0)
           return err(op, "tensor extent product is zero or overflows int64");
-        if (maxLanes > 0 && *ne > maxLanes)
+        // maxLanes is validated positive in runOnOperation; a non-positive
+        // value must never silently disable this guard (the race construction
+        // below it is quadratic in the lane count).
+        if (*ne > maxLanes)
           return err(op, "tensor extent product (" + Twine(*ne) +
                              ") exceeds the max-lanes tractability threshold "
                              "(" +
@@ -2396,6 +2399,16 @@ void ConvertTritonToSMT::runOnOperation() {
     module.emitError(
         "TritonToSMT: block-size applies only to the identity-addressing "
         "path; do not combine it with memory-model");
+    return signalPassFailure();
+  }
+  // The tractability cap is mandatory: a non-positive max-lanes must reject
+  // loudly rather than silently disable the guard (the intra-store race
+  // construction is quadratic in the lane count, and the driver applies no
+  // timeout to the encoder subprocess).
+  if (memoryModel && maxLanes <= 0) {
+    module.emitError("TritonToSMT: max-lanes must be positive (got " +
+                     Twine(maxLanes) + "); the extent-product tractability "
+                     "guard cannot be disabled");
     return signalPassFailure();
   }
   bool built = memoryModel

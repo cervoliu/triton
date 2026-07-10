@@ -1933,3 +1933,20 @@ def test_block_size_pins_legacy_contract():
     res = tv.check_equivalence(_SHIFTED_A, _SHIFTED_2A, block_size=1)
     assert res.verdict == "UNSUPPORTED", res.verdict
     assert not res.memory_model
+
+
+def test_reject_nonpositive_max_lanes():
+    # Codex phase-3 review round 1: max-lanes <= 0 must reject rather than
+    # silently disable the extent-product tractability guard (the intra-store
+    # race construction is quadratic in the lane count and the encoder runs
+    # without a subprocess timeout).
+    import subprocess
+    for cap in ("0", "-4"):
+        r = subprocess.run(
+            [tv.default_triton_opt(),
+             f"--convert-triton-to-smt=memory-model=true max-lanes={cap}"],
+            input=tv.build_query_module(_RACE_STORE, _RACE_STORE,
+                                        tv.default_triton_opt()),
+            capture_output=True, text=True, timeout=60)
+        assert r.returncode != 0, (cap, r.stderr)
+        assert "max-lanes must be positive" in r.stderr, (cap, r.stderr)

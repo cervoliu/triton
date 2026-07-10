@@ -69,7 +69,9 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
     Option<"maxLanes", "max-lanes", "int64_t", /*default*/"256",
            "memory-model mode: maximum tensor extent product materialized as "
            "concrete lanes; larger tensors are rejected loudly (encoder and "
-           "solver tractability bound, independent of the rank <= 2 cap)">,
+           "solver tractability bound, independent of the rank <= 2 cap). "
+           "Must be positive: the guard is mandatory and a non-positive "
+           "value is rejected rather than treated as unlimited">,
   ];
 }
 
