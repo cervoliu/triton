@@ -1,6 +1,7 @@
 # Phase 3 — a real memory model (absorb mlir-tv's block model)
 
-> **Status: IMPLEMENTED** (`memory-model` pass option + driver retry routing).
+> **Status: COMPLETE — Codex review APPROVED (round 2)**; the `memory-model`
+> pass option + driver retry routing landed, see `phase-3-review.md`.
 > Sections below are the original plan; every place the implementation
 > deliberately diverges is recorded in
 > [Implementation notes](#implementation-notes-resolved-decisions) at the end

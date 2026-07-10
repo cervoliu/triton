@@ -31,7 +31,7 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
 - [`phase-2-review.md`](phase-2-review.md) — the approved Codex review of
   phase-2 milestones 2–4 (latest round; earlier rounds' findings are pinned
   as regression tests).
-- [`phase-3.md`](phase-3.md) — phase 3, IMPLEMENTED (in review): a block
+- [`phase-3.md`](phase-3.md) — phase 3, COMPLETE and review-approved: a block
   memory model absorbed from mlir-tv — one block per pointer argument (bv64
   offsets, symbolic size), N-D lane materialization (rank ≤ 2), OOB and
   intra-store races as UB — behind the `memory-model` pass option; the driver
@@ -41,6 +41,9 @@ Sphinx documentation tree (`docs/*.rst`, `docs/conf.py`).
   addptr modeled exactly in 64-bit instead of rejected; data-dependence taint
   instead of literal affine decomposition). `tt.dot`/`scf.for` deferred to
   phase 4.
+- [`phase-3-review.md`](phase-3-review.md) — the approved Codex review of
+  phase 3 (round 2; the round-1 finding — a `max-lanes` tractability-guard
+  bypass — is pinned as lit + pytest regressions).
 
 ## Review harness
 

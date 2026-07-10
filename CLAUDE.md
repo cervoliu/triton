@@ -7,7 +7,12 @@ Triton kernels: the `--convert-triton-to-smt` pass
 `smt` dialect via `scripts/patches/mlir-smt-real.patch`. Docs index:
 `docs/smt-tv/README.md`. The pass always emits three solver scopes in fixed
 order (0 addressing, 1 UB-domain equality, 2 equivalence); the driver decodes
-them positionally — change both together.
+them positionally — change both together. Since phase 3 there are two
+encodings behind that one contract: the identity-addressing path (tried
+first) and the block memory model (`memory-model=true`, where scope 0 is a
+documented always-unsat placeholder); the driver retries with the block model
+when the legacy path rejects or scope 0 is sat. See
+`docs/smt-tv/phase-3.md` ("Implementation notes") before touching either.
 
 ## Environment
 

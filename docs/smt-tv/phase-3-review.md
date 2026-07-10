@@ -1,71 +1,56 @@
-# Review: Phase 3 — block memory model and driver retry routing
+# Review: Phase 3 — block memory model and driver retry routing, round 2
 
 ## Verdict
 
-**Changes requested.** A non-positive `max-lanes` value silently disables the mandatory tractability guard, allowing the encoder’s quadratic race construction to hang or exhaust memory.
+**Approved.** The confirmed round-1 tractability-guard bypass is fixed and no remaining blocking soundness or crash issue was found within phase 3's documented contract.
 
 ## Progress since the previous review
 
-Commit `a897b506f` adds the phase-3 block-memory encoding while preserving the legacy phase-1/2 path:
+Commit `30d74931a` closes the round-1 finding:
 
-- Pointer arguments become distinct, fully initialized SMT arrays with shared symbolic non-negative sizes.
-- `tt.addptr` offsets are sign-extended from i32 and accumulated in bv64, avoiding the legacy chained-offset wraparound.
-- Static tensors through rank 2 are concretely materialized in row-major order.
-- Active OOB accesses, poison reaching memory, and intra-store different-value collisions contribute to the exact UB predicate.
-- Loads observe prior stores, and multiple stores fold sequentially into each function’s private final state.
-- Memory-derived addressing is rejected through taint propagation, while memory-dependent masks and stored values remain supported.
-- Scope 0 remains as the documented constant-false placeholder; scopes 1 and 2 respectively compare UB domains and final block states.
-- The driver preserves the three-result positional contract and retries the memory model only after legacy rejection or a satisfiable identity-addressing scope.
-- Tests were added for strided 2-D addressing, masking, reductions, chained pointers, races, sequential memory, and the documented rejection boundaries.
+- `memory-model` mode rejects `max-lanes <= 0` before constructing any solver scope.
+- The per-tensor check now applies the positive cap unconditionally; zero and negative values cannot mean "unlimited."
+- The pass option documentation explicitly states that the cap is mandatory and must be positive.
+- The diagnostic formats the `int64_t` value through `Twine`, avoiding the prior character-overload output.
+- Lit regressions cover `max-lanes=0` and `max-lanes=-4`.
+- Pytest independently invokes the pass for both values and checks for the expected rejection diagnostic.
 
-The main default-path encoding appears internally consistent under the implementation notes’ deliberate assumptions. No static false-`EQUIVALENT` path was identified in block decomposition, per-block final-state comparison, OOB masking, store folding, or memory-dependence propagation.
+The caller reproduced the original defect before fixing it: `max-lanes=1` rejected with status 1, while `max-lanes=0` encoded with status 0. After the fix, both non-positive cases reject.
+
+The rest of the phase-3 implementation remains unchanged: bv64 block offsets, symbolic block sizes, rank-2 lane materialization, OOB and intra-store-race UB, sequential stores, memory-dependence tainting, three fixed solver scopes, and legacy-to-memory-model retry routing.
+
+(Round 1 requested changes for the `max-lanes` guard bypass — a non-positive
+value silently disabled the mandatory extent-product tractability bound ahead
+of the quadratic race construction. The fix and its reproducer are pinned by
+the lit BADCAP runs in `test/Conversion/triton_to_smt_memory_model.mlir` and
+`test_reject_nonpositive_max_lanes` in
+`python/test/unit/tools/test_smt_equivalence.py`.)
 
 ## Findings
 
-### [P2] Reject non-positive `max-lanes` instead of disabling the tractability guard
-
-**References:** `include/triton/Conversion/TritonToSMT/Passes.td:69-72`, `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:1456-1471`, `lib/Conversion/TritonToSMT/TritonToSMTPass.cpp:1848-1860`, `python/triton/tools/smt_equivalence.py:104-110`, `python/triton/tools/smt_equivalence.py:267-281`, `python/test/unit/tools/test_smt_equivalence.py:1888-1894`.
-
-Static status: `PLAUSIBLE-UNREPRODUCED`; execution is unavailable in this sandbox.
-
-The option is documented as the maximum materialized extent product, and phase 3 requires every oversized tensor to be rejected. The implementation instead checks the limit only when `maxLanes > 0`:
-
-```cpp
-if (maxLanes > 0 && *ne > maxLanes)
-  return err(...);
-```
-
-Consequently, both `max-lanes=0` and negative values disable the cap entirely. This is not documented as an opt-out and contradicts the phase’s mandatory tractability boundary. It is particularly dangerous because every store subsequently enumerates all lane pairs when constructing race conditions. The driver supplies no timeout to the `triton-opt` subprocess; its timeout applies only to Z3 after encoding completes.
-
-Caller reproducer:
-
-```sh
-OPT=build/<actual-build-dir>/bin/triton-opt
-
-"$OPT" \
-  --convert-triton-to-smt='memory-model=true max-lanes=1' \
-  test/Conversion/triton_to_smt_memory_model.mlir
-
-"$OPT" \
-  --convert-triton-to-smt='memory-model=true max-lanes=0' \
-  test/Conversion/triton_to_smt_memory_model.mlir
-```
-
-The existing module has extent product 4. The first command should reject it, while the current condition allows the second command to encode it. That establishes the guard bypass without requiring a resource-exhaustion run. A 257×257 variant then enters roughly 2.18 billion lane-pair checks per store instead of rejecting immediately, before SMT solving or its timeout begins.
-
-Reject `maxLanes <= 0` before constructing any scope and add direct lit regressions for zero and negative values. The current oversized-extent pytest covers only the default positive limit and does not exercise this option boundary.
+No findings.
 
 ## Validation summary
 
-This was a static review of commit `a897b506f`; no build, test, solver, reproducer, or file write was possible.
+Caller-supplied verification reports `scripts/smt-verify.sh` green:
 
-Statically inspected:
+- Lit: 5/5 passing.
+- Pytest: 99/99 passing.
+- No skips.
 
-- The complete phase-3 specification and implementation notes.
-- The prior phase-2 review.
-- Pass option definitions and both encoder paths.
-- Block declaration, offset accumulation, OOB predicates, taint propagation, masking, race construction, sequential stores, reductions, and final-state comparison.
-- Driver fallback routing, result-count validation, verdict decoding, and environment-error handling.
-- The phase-3 pytest and lit additions.
+This round statically re-reviewed the combined `a897b506f + 30d74931a` state. No command, build, solver, or reproducer was executed inside the review sandbox.
 
-Before applying a fix, the caller should run the reproducer above. Afterward, add zero/negative `max-lanes` regressions and run `scripts/smt-verify.sh` so skips cannot masquerade as passing soundness coverage.
+The static audit covered:
+
+- Up-front option validation and all tensor extent/rank guards.
+- Shared source/target arrays, sizes, scalar inputs, and program IDs.
+- Signed bv64 OOB predicates and exact mask gating.
+- Poison propagation at loads and stores.
+- Intra-store collision predicates and their structural elisions.
+- Sequential store folding and load-after-store visibility.
+- Per-block whole-array final-state comparison under shared UB domains.
+- Memory-derived-address taint propagation through accepted operations.
+- Rejection of unsupported pointer decomposition, shapes, atomics, `tt.dot`, and control flow.
+- Driver retry conditions, three-result validation, and verdict precedence.
+
+The implementation notes' deliberate boundaries—fully initialized argument blocks, intra-store race policy, program-ordered multiple stores, disjoint pointer arguments, per-program refinement, and the preserved legacy encoding—remain consistently implemented and do not create an identified false-`EQUIVALENT` path within the stated model.
