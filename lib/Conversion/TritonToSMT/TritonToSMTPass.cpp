@@ -50,6 +50,7 @@
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
@@ -1440,6 +1441,31 @@ bool ConvertTritonToSMT::encodeFunctionMM(
     return sb.bor(sb.bvcmp(smt::BVCmpPredicate::slt, off, zeroPtr),
                   sb.bvcmp(smt::BVCmpPredicate::sge, off, size));
   };
+  // Restrict load-bearing gate (soundness). Each pointer-arg block is a
+  // DISTINCT SMT array, so distinct pointer args are disjoint by
+  // construction -- but TTIR carries no restrict/const attribute, so that
+  // disjointness is ASSUMED, not verified. It can only change an observable
+  // output when a memory op touches one block AFTER a store already went to
+  // a DIFFERENT block (were the two aliased, the write to Y would then be
+  // visible at X). We track the set of written blocks and flag any later
+  // cross-block access; touching a block after a store to the SAME block is
+  // the sequential-visibility behavior deliberately modeled here and is NOT
+  // flagged. Unless assume-restrict is set, such a function is rejected --
+  // the check fires before the offending op is folded, so no potentially
+  // false EQUIVALENT is ever emitted (see docs/smt-tv/phase-3.md). With
+  // assume-restrict the bookkeeping is skipped entirely and the encoding is
+  // byte-identical to the disjoint-by-construction model.
+  DenseSet<Value> storedBlocks;
+  auto restrictLoadBearing = [&](Value block) {
+    // True iff some previously-written block differs from this access's block.
+    return storedBlocks.size() > (storedBlocks.count(block) ? 1u : 0u);
+  };
+  const char *restrictWhy =
+      "disjointness of pointer arguments is load-bearing for this verdict (a "
+      "memory op addresses one pointer-arg block after a store to a different "
+      "pointer-arg block) and TTIR provides no restrict guarantee; rejected. "
+      "Pass assume-restrict=true to obtain a verdict conditional on "
+      "non-aliasing";
 
   for (Operation &opRef : entry) {
     Operation *op = &opRef;
@@ -1704,6 +1730,8 @@ bool ConvertTritonToSMT::encodeFunctionMM(
                   EncodedValue p = env[o.getPtr()];
                   if (!p.isPtr() || !p.size)
                     return err(o, "load through an unmodeled pointer");
+                  if (!assumeRestrict && restrictLoadBearing(p.array))
+                    return err(o, restrictWhy);
                   if (!lanesConsistent(p))
                     return err(o, "internal lane/shape mismatch");
                   Type range =
@@ -1793,6 +1821,11 @@ bool ConvertTritonToSMT::encodeFunctionMM(
                   EncodedValue p = env[o.getPtr()];
                   if (!p.isPtr() || !p.size)
                     return err(o, "store through an unmodeled pointer");
+                  if (!assumeRestrict) {
+                    if (restrictLoadBearing(p.array))
+                      return err(o, restrictWhy);
+                    storedBlocks.insert(p.array);
+                  }
                   Type range =
                       cast<smt::ArrayType>(p.array.getType()).getRangeType();
                   EncodedValue val = env[o.getValue()];
@@ -2315,7 +2348,11 @@ void ConvertTritonToSMT::runOnOperation() {
         // The block: fully-initialized symbolic contents plus a symbolic
         // element count. Distinct arguments are distinct SMT arrays, which
         // formalizes the phase-1 "pointer args are disjoint" (restrict)
-        // assumption. Memory is modeled as always readable (CUDA global
+        // assumption. TTIR carries no restrict/const attribute, so that
+        // disjointness is ASSUMED, not verified; the restrict load-bearing
+        // gate in encodeFunctionMM rejects any function where it could change
+        // the verdict unless assume-restrict is set (see phase-3.md). Memory
+        // is modeled as always readable (CUDA global
         // memory holds SOME value); reading an offset the kernel has not
         // written is defined-but-unknown, not UB -- see phase-3.md for why
         // this deliberately diverges from mlir-tv's uninitialized-read UB.

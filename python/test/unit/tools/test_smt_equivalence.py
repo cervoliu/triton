@@ -1797,31 +1797,30 @@ def test_same_race_both_sides_equivalent():
 #     sees the stored value. ---
 
 _SEQ_RMW = _mod("""
-  tt.func public @k(%o: !tt.ptr<f32>, %p: !tt.ptr<f32>, %x: f32) {
+  tt.func public @k(%o: !tt.ptr<f32>, %x: f32) {
     %pid = tt.get_program_id x : i32
     %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
     tt.store %po, %x : !tt.ptr<f32>
     %y = tt.load %po : !tt.ptr<f32>
-    %pp = tt.addptr %p, %pid : !tt.ptr<f32>, i32
-    tt.store %pp, %y : !tt.ptr<f32>
+    tt.store %po, %y : !tt.ptr<f32>
     tt.return
   }""")
 _SEQ_DIRECT = _mod("""
-  tt.func public @k(%o: !tt.ptr<f32>, %p: !tt.ptr<f32>, %x: f32) {
+  tt.func public @k(%o: !tt.ptr<f32>, %x: f32) {
     %pid = tt.get_program_id x : i32
     %po = tt.addptr %o, %pid : !tt.ptr<f32>, i32
     tt.store %po, %x : !tt.ptr<f32>
-    %pp = tt.addptr %p, %pid : !tt.ptr<f32>, i32
-    tt.store %pp, %x : !tt.ptr<f32>
+    tt.store %po, %x : !tt.ptr<f32>
     tt.return
   }""")
 
 
 def test_load_after_store_sees_stored_value():
-    # Multiple stores are legal under the block model (folded in program
-    # order), and the reload reads the just-stored value, not the initial
-    # memory. The legacy path rejects this (two stores), so it routes to the
-    # memory model.
+    # Multiple stores to the SAME block are legal under the block model
+    # (folded in program order), and the reload reads the just-stored value,
+    # not the initial memory. The legacy path rejects this (two stores), so it
+    # routes to the memory model. (Both memory ops stay on block %o, so the
+    # restrict load-bearing gate does not fire.)
     res = tv.check_equivalence(_SEQ_RMW, _SEQ_DIRECT)
     assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
     assert res.memory_model
@@ -1950,3 +1949,79 @@ def test_reject_nonpositive_max_lanes():
             capture_output=True, text=True, timeout=60)
         assert r.returncode != 0, (cap, r.stderr)
         assert "max-lanes must be positive" in r.stderr, (cap, r.stderr)
+
+
+# --- Aliasing / restrict soundness gate (block memory model). Distinct
+#     pointer-arg blocks are DISTINCT SMT arrays (disjoint by construction), but
+#     TTIR carries no restrict guarantee. A and B are EQUIVALENT iff the three
+#     pointer args are mutually disjoint: A re-loads `in` AFTER storing `out`
+#     (2*t), while B reuses the first load, so an in-place launch (out == in)
+#     makes them differ. The block model must NOT silently prove them
+#     EQUIVALENT -- that would be a false verdict for the most common aliasing
+#     calling convention. See docs/smt-tv/phase-3.md. ---
+
+_ALIAS_A = _mod("""
+  tt.func public @k(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>, %out2: !tt.ptr<f32>, %n: i32) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %two = arith.constant 2.000000e+00 : f32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pin = tt.addptr %in, %idx : !tt.ptr<f32>, i32
+    %t = tt.load %pin, %m, %cst : !tt.ptr<f32>
+    %d = arith.mulf %t, %two : f32
+    %pout = tt.addptr %out, %idx : !tt.ptr<f32>, i32
+    tt.store %pout, %d, %m : !tt.ptr<f32>
+    %pin2 = tt.addptr %in, %idx : !tt.ptr<f32>, i32
+    %u = tt.load %pin2, %m, %cst : !tt.ptr<f32>
+    %pout2 = tt.addptr %out2, %idx : !tt.ptr<f32>, i32
+    tt.store %pout2, %u, %m : !tt.ptr<f32>
+    tt.return
+  }""")
+_ALIAS_B = _mod("""
+  tt.func public @k(%in: !tt.ptr<f32>, %out: !tt.ptr<f32>, %out2: !tt.ptr<f32>, %n: i32) {
+    %cst = arith.constant 0.000000e+00 : f32
+    %two = arith.constant 2.000000e+00 : f32
+    %idx = tt.get_program_id x : i32
+    %m = arith.cmpi slt, %idx, %n : i32
+    %pin = tt.addptr %in, %idx : !tt.ptr<f32>, i32
+    %t = tt.load %pin, %m, %cst : !tt.ptr<f32>
+    %d = arith.mulf %t, %two : f32
+    %pout = tt.addptr %out, %idx : !tt.ptr<f32>, i32
+    tt.store %pout, %d, %m : !tt.ptr<f32>
+    %pout2 = tt.addptr %out2, %idx : !tt.ptr<f32>, i32
+    tt.store %pout2, %t, %m : !tt.ptr<f32>
+    tt.return
+  }""")
+
+
+def test_aliasing_loadbearing_rejected_by_default():
+    # The disjoint-by-construction block arrays would prove a FALSE EQUIVALENT
+    # under aliasing, so the memory model must REJECT this load-bearing pair
+    # (a memory op addresses one pointer-arg block after a store to a different
+    # one) rather than emit a verdict. The legacy path already rejects the two
+    # stores, so the memory-model retry is what fires the gate.
+    res = tv.check_equivalence(_ALIAS_A, _ALIAS_B)
+    assert res.verdict == "UNSUPPORTED", (res.verdict, res.z3_output)
+    assert res.verdict != "EQUIVALENT"
+    assert res.memory_model, "expected the block-memory-model retry to be attempted"
+
+
+def test_aliasing_loadbearing_equivalent_under_restrict():
+    # assume_restrict encodes under the disjointness (restrict) assumption
+    # instead of rejecting; A == B provided the pointer args do not alias, so
+    # the honest verdict is EQUIVALENT_UNDER_RESTRICT (true for A/B under
+    # disjointness). The over-disclosed caveat never lies.
+    res = tv.check_equivalence(_ALIAS_A, _ALIAS_B, assume_restrict=True)
+    assert res.verdict == "EQUIVALENT_UNDER_RESTRICT", (res.verdict, res.z3_output)
+    assert res.memory_model
+
+
+def test_load_compute_store_still_equivalent():
+    # An ordinary load -> compute -> store kernel is NOT load-bearing (no memory
+    # op touches a block after a store to a different block), so the block model
+    # still returns a plain EQUIVALENT under default settings -- no spurious
+    # rejection and no caveat. Uses the shifted-store self-pair, which routes to
+    # the memory model (non-identity addressing) yet is not load-bearing.
+    res = tv.check_equivalence(_SHIFTED_A, _SHIFTED_A)
+    assert res.verdict == "EQUIVALENT", (res.verdict, res.z3_output)
+    assert res.memory_model, "expected the block-memory-model retry path"

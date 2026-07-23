@@ -309,6 +309,30 @@ divergence is a modeling decision, not a gap.
   `!tt.ptr` arguments today, so there is nothing to check; the planned
   store-to-const rejection is moot until such an attribute exists.
 
+- **Pointer-arg disjointness is gated, not silently assumed.** The block model
+  gives each `!tt.ptr` argument its own SMT array, so distinct pointer args are
+  disjoint *by construction* — but TTIR has no `restrict`/`const` attribute, so
+  that disjointness is an assumption, not a fact. It can only change an
+  observable output when a memory op addresses one block *after* a store
+  already went to a *different* block (an in-place / aliasing launch,
+  `out == in`, then differs; a load/store to the SAME block after a store is
+  the sequential-visibility behavior already modeled and is fine).
+  `encodeFunctionMM` tracks the set of written blocks and flags any such
+  cross-block access as **restrict-load-bearing**. By default the pass then
+  **rejects** (`signalPassFailure` → UNSUPPORTED) rather than risk a false
+  EQUIVALENT under aliasing — the ordinary load-all → compute → store-all shape
+  is never load-bearing, so this costs coverage only on the genuinely dangerous
+  class. The `assume-restrict` pass option encodes under the disjointness
+  assumption instead of rejecting; the driver then relabels a memory-model
+  EQUIVALENT as **`EQUIVALENT_UNDER_RESTRICT`** — equivalent provided the
+  pointer args do not alias. That relabel over-discloses (any MM EQUIVALENT
+  under the flag carries the caveat, even a kernel that was not load-bearing),
+  which is sound (over-disclosing a precondition never lies) and needs no fourth
+  scope or side channel: the three-scope positional contract is untouched.
+  Pinned by `test_aliasing_loadbearing_rejected_by_default`,
+  `test_aliasing_loadbearing_equivalent_under_restrict`,
+  `test_load_compute_store_still_equivalent`, and `triton_to_smt_restrict.mlir`.
+
 - **Newly validated (previously UNSUPPORTED).** Non-identity addressing
   (shifted stores), rank-2 tensors and axis reductions over them, masked
   loads feeding reductions, multiple stores per kernel, chained addptr,

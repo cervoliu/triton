@@ -183,7 +183,12 @@ def build_query_module(src_ttir: str, tgt_ttir: str, triton_opt: str) -> str:
 
 @dataclass
 class EquivalenceResult:
-    verdict: str             # EQUIVALENT | NOT_EQUIVALENT | UNSUPPORTED | UNKNOWN
+    # EQUIVALENT | EQUIVALENT_UNDER_RESTRICT | NOT_EQUIVALENT | UNSUPPORTED |
+    # UNKNOWN. EQUIVALENT_UNDER_RESTRICT is a memory-model EQUIVALENT produced
+    # with assume_restrict=True: the verdict holds only if the pointer
+    # arguments are non-aliasing (a precondition TTIR cannot express, so it is
+    # disclosed rather than assumed silently). See check_equivalence.
+    verdict: str
     # z3 result of scope 0. On the identity-addressing (legacy) path this is
     # the addressing-identity check (sat => non-identity addressing, which
     # triggers the memory-model retry). On the memory-model path scope 0 is a
@@ -209,6 +214,7 @@ class EquivalenceResult:
 
 
 def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
+                      assume_restrict: bool = False,
                       counterexample: bool = False, timeout: float = 60.0,
                       triton_opt: Optional[str] = None,
                       mlir_translate: Optional[str] = None,
@@ -228,6 +234,16 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
     pins the identity-addressing contract and disables the retry (the option
     is a legacy-path cross-check with no memory-model counterpart). The retry
     can double the worst-case runtime (two solver runs of up to ``timeout``).
+
+    ``assume_restrict`` only affects the block-memory-model path: distinct
+    pointer arguments are disjoint SMT arrays by construction, which the pass
+    otherwise rejects when that disjointness is load-bearing for the verdict
+    (TTIR carries no ``restrict`` guarantee). With ``assume_restrict=True`` the
+    pass encodes under the disjointness assumption instead of rejecting, and a
+    resulting memory-model ``EQUIVALENT`` is relabeled ``EQUIVALENT_UNDER_
+    RESTRICT`` -- equivalent provided the pointer args do not alias. It never
+    weakens the legacy (identity-addressing) path or a ``block_size``-pinned
+    run.
     """
     triton_opt = triton_opt or default_triton_opt()
     mlir_translate = mlir_translate or default_mlir_translate()
@@ -342,10 +358,21 @@ def check_equivalence(src_ttir: str, tgt_ttir: str, *, block_size: int = 0,
     # addressing (scope 0 sat). An explicit block_size pins the legacy
     # contract, so no retry. UNKNOWN results are NOT retried: the legacy
     # encoding accepted the kernels and only the solver struggled.
+    mm_opt = "--convert-triton-to-smt=memory-model=true"
+    if assume_restrict:
+        mm_opt += " assume-restrict=true"
     if block_size <= 0 and (res.verdict == "UNSUPPORTED"
                             or res.addressing_status == "sat"):
-        res = _pipeline("--convert-triton-to-smt=memory-model=true",
-                        memory_model=True)
+        res = _pipeline(mm_opt, memory_model=True)
+        # assume_restrict over-discloses: ANY memory-model EQUIVALENT under the
+        # flag carries the non-aliasing caveat, even for a kernel that was not
+        # actually load-bearing. Over-disclosing a precondition never lies, so
+        # this stays sound; we deliberately do NOT add a fourth solver scope or
+        # a side channel to make it precise (the three-scope positional
+        # contract is fixed). Relabel only the memory-model path -- the legacy
+        # path is untouched by assume_restrict.
+        if assume_restrict and res.verdict == "EQUIVALENT":
+            res.verdict = "EQUIVALENT_UNDER_RESTRICT"
 
     # Request a counterexample model only once we know the equivalence scope is
     # sat; asking after unsat/unknown makes z3 error with "model not available".

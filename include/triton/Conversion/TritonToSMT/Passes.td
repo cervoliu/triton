@@ -72,6 +72,16 @@ def ConvertTritonToSMT : Pass<"convert-triton-to-smt", "mlir::ModuleOp"> {
            "solver tractability bound, independent of the rank <= 2 cap). "
            "Must be positive: the guard is mandatory and a non-positive "
            "value is rejected rather than treated as unlimited">,
+    Option<"assumeRestrict", "assume-restrict", "bool", /*default*/"false",
+           "memory-model mode: do not reject when pointer-arg disjointness is "
+           "load-bearing (a memory op addresses one pointer-arg block after a "
+           "store to a different pointer-arg block). Distinct pointer args are "
+           "distinct SMT arrays -- disjoint by construction -- but TTIR carries "
+           "no restrict/const guarantee, so by default such a kernel is "
+           "rejected rather than risk a false EQUIVALENT under aliasing. With "
+           "this set, encode under the disjointness (restrict) assumption; the "
+           "verdict is then conditional on the pointer args being non-aliasing "
+           "(the driver labels it EQUIVALENT_UNDER_RESTRICT)">,
   ];
 }
 
